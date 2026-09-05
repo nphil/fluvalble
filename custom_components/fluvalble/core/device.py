@@ -99,6 +99,11 @@ BLE_LOOKUP_RETRIES = 3
 PREVIEW_STEP_SECONDS = 2
 TRANSITION_STEP_SECONDS = 30
 DAY_MINUTES = 24 * 60
+# Settle-then-poll delays (seconds) for reading a schedule back after writing
+# it. The AquaSky answers an immediate status read with the previous
+# schedule; by ~1-2 s it reports the new one. Total worst case ~5.5 s, well
+# inside the 90 s schedule-write deadline. Tests shrink this to zeros.
+SCHEDULE_VERIFY_SETTLE = (0.5, 1.0, 2.0, 2.0)
 # Overall ceiling on one public command's `command_transaction()` hold of
 # `_command_transaction_lock`. Client already bounds every individual
 # GATT-facing await, so this is a backstop - it exists for the rare case
@@ -1363,15 +1368,29 @@ class Device:
         return True
 
     async def _async_verify_native_auto_schedule(self, requested: dict[str, Any], *, channel_count: int) -> str | None:
-        """Re-read the fixture's Auto schedule and return the first mismatched field, or None."""
-        if self.client is None:
-            return "unreachable"
-        try:
-            await self.client.request_state()
-        except (TimeoutError, BleakError) as err:
-            _LOGGER.debug("Unable to read back Fluval Auto schedule for verification", exc_info=err)
-            return "unreachable"
-        return _auto_schedule_mismatch(requested, self.values.get("native_auto_schedule"), channel_count=channel_count)
+        """Re-read the fixture's Auto schedule and return the first mismatched field, or None.
+
+        The fixture answers a status read issued right after a schedule write
+        with the *previous* schedule (observed live 2026-09-05: three writes
+        that were correct on the wire failed an immediate readback, while the
+        same schedule read back correctly 5 s later). So the readback is
+        polled with a short settle instead of trusted on the first sample.
+        """
+        mismatch: str | None = "unreachable"
+        for delay in SCHEDULE_VERIFY_SETTLE:
+            await asyncio.sleep(delay)
+            if self.client is None:
+                return "unreachable"
+            try:
+                await self.client.request_state()
+            except (TimeoutError, BleakError) as err:
+                _LOGGER.debug("Unable to read back Fluval Auto schedule for verification", exc_info=err)
+                mismatch = "unreachable"
+                continue
+            mismatch = _auto_schedule_mismatch(requested, self.values.get("native_auto_schedule"), channel_count=channel_count)
+            if mismatch is None:
+                return None
+        return mismatch
 
     def native_pro_schedule_limits(self) -> tuple[str, int, int]:
         """Return the APK-defined Professional-schedule limits for this fixture."""
@@ -1526,16 +1545,27 @@ class Device:
     async def _async_verify_native_pro_schedule(
         self, requested: list[dict[str, Any]], *, channel_count: int
     ) -> str | None:
-        """Re-read the fixture's Professional schedule and return "points" on mismatch, or None."""
-        if self.client is None:
-            return "unreachable"
-        try:
-            await self.client.request_state()
-        except (TimeoutError, BleakError) as err:
-            _LOGGER.debug("Unable to read back Fluval Professional schedule for verification", exc_info=err)
-            return "unreachable"
-        readback = self._canonical_pro_points(self.values.get("native_pro_schedule") or [])
-        return _pro_schedule_mismatch(requested, readback, channel_count=channel_count)
+        """Re-read the fixture's Professional schedule and return "points" on mismatch, or None.
+
+        Same settle-then-poll as the Auto verify: an immediate readback can
+        still show the previous schedule.
+        """
+        mismatch: str | None = "unreachable"
+        for delay in SCHEDULE_VERIFY_SETTLE:
+            await asyncio.sleep(delay)
+            if self.client is None:
+                return "unreachable"
+            try:
+                await self.client.request_state()
+            except (TimeoutError, BleakError) as err:
+                _LOGGER.debug("Unable to read back Fluval Professional schedule for verification", exc_info=err)
+                mismatch = "unreachable"
+                continue
+            readback = self._canonical_pro_points(self.values.get("native_pro_schedule") or [])
+            mismatch = _pro_schedule_mismatch(requested, readback, channel_count=channel_count)
+            if mismatch is None:
+                return None
+        return mismatch
 
     @serialized_device_command
     async def async_set_native_effect_schedule(self, windows: list[dict[str, Any]]) -> bool:

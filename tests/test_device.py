@@ -343,6 +343,10 @@ class _FakeVerifyClient:
         self.raw_facebd = True
 
     async def request_state(self):
+        self.reads = getattr(self, "reads", 0) + 1
+        # Optional sequence of readbacks: replay one per read, then hold the last.
+        if getattr(self, "auto_sequence", None):
+            self.auto_schedule = self.auto_sequence.pop(0) if len(self.auto_sequence) > 1 else self.auto_sequence[0]
         if self.auto_schedule is not None:
             self.device.values["native_auto_schedule"] = self.auto_schedule
         if self.pro_schedule is not None:
@@ -2891,3 +2895,41 @@ def test_device_name_falls_back_to_the_model_when_name_is_blank():
         },
     )
     assert device.name == "Fluval Plant PRO LED"
+
+
+def test_auto_schedule_verify_polls_past_a_stale_first_readback():
+    """Live 2026-09-05: a status read issued right after a schedule write still
+    reports the PREVIOUS schedule; the same read ~1-2 s later reports the new
+    one. An immediate single-sample verify wrongly failed three correct
+    writes. The verifier must poll with a settle and accept a later sample."""
+    asyncio.run(_async_test_auto_schedule_verify_polls_past_a_stale_first_readback())
+
+
+async def _async_test_auto_schedule_verify_polls_past_a_stale_first_readback():
+    device = _make_device(product_id=546)
+    device._async_prepare_command = AsyncMock(return_value=True)
+    device._async_send_packet = AsyncMock(return_value=True)
+    previous = {
+        "sunrise": {"hour": 8, "minute": 0, "ramp": 60},
+        "sunset": {"hour": 20, "minute": 30, "ramp": 45},
+        "sleep": {"hour": 23, "minute": 15},
+        "day_levels": [68, 100, 100, 90, 0],
+        "night_levels": [0, 5, 0, 0, 10],
+    }
+    settled = dict(previous, day_levels=[40, 60, 60, 54, 0])
+    client = _FakeVerifyClient(device)
+    client.auto_sequence = [previous, settled]      # first read stale, second read correct
+    device.client = client
+    requested = {
+        "sunrise": (8, 0, 60),
+        "sunset": (20, 30, 45),
+        "sleep": (23, 15),
+        "day_levels": [40, 60, 60, 54, 0],
+        "night_levels": [0, 5, 0, 0, 10],
+    }
+
+    assert await device.async_set_native_auto_schedule(requested)
+
+    assert device._async_send_packet.await_count == 2   # one write, no retry: the poll absorbed the stale sample
+    assert client.reads == 2
+    assert device.values["native_auto_schedule"] == settled

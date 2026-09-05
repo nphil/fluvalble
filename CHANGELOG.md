@@ -5,6 +5,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.1.3]
+
+### Fixed
+- Schedule-write verification polls the readback with a short settle instead of trusting an immediate single read, which reported the previous schedule and failed correct writes.
+
 ## [1.1.2]
 
 ### Fixed

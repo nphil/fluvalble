@@ -444,3 +444,14 @@ def advertisement():
     adv.service_uuids = ["00001002-0000-1000-8000-00805f9b34fb"]
     adv.rssi = -65
     return adv
+
+
+@pytest.fixture(autouse=True)
+def _instant_schedule_verify(monkeypatch):
+    """Keep the settle-then-poll verify (device.py SCHEDULE_VERIFY_SETTLE) instant in tests."""
+    try:
+        from custom_components.fluvalble.core import device as device_module
+    except Exception:  # noqa: BLE001 - modules that cannot import skip this fixture
+        return
+    if hasattr(device_module, "SCHEDULE_VERIFY_SETTLE"):
+        monkeypatch.setattr(device_module, "SCHEDULE_VERIFY_SETTLE", (0, 0, 0, 0))
