@@ -39,7 +39,6 @@
         "title": "Connection options",
         "data": {
           "lamp_profile": "Lamp type",
-          "hold_connection": "Hold Bluetooth connection",
           "ping_interval": "Keep-alive interval (seconds)",
           "active_time": "Active connection window (seconds)",
           "expected_mode": "Guardian expected mode",
@@ -49,9 +48,8 @@
         },
         "data_description": {
           "lamp_profile": "Override auto-detection when the wrong model or channel count is shown. Plant and Marine/Reef use their distinct five-channel spectral layouts.",
-          "hold_connection": "Keep Home Assistant's BLE connection to the fixture open permanently and reconnect automatically, for the lowest possible command latency. Off (the default) connects on demand instead - for commands and for the guardian's periodic checks - and disconnects again after the active connection window; this fixture only accepts one BLE controller at a time, so leaving this off keeps the connection free for the Fluval app between checks. Same effect as the Bluetooth connection switch.",
           "ping_interval": "How often Home Assistant reads from the light to keep the BLE connection alive. Lower values improve reliability at the cost of slightly more radio traffic. Default: 10 s.",
-          "active_time": "How long to maintain the BLE connection after the last command. Use 0 for a persistent connection with the lowest command latency, or 30–600 seconds to disconnect when idle. Persistent connections consume a Bluetooth connection slot and can prevent the Fluval app or gateway from connecting. Default: 120 s.",
+          "active_time": "How long to maintain the BLE connection after the last command. Use 0 for a persistent connection with the lowest command latency, or 30–600 seconds to disconnect when idle. A finite window releases the connection so the Fluval app can connect - there is nothing to do in the app itself, the link is simply released after the idle window. Persistent connections consume a Bluetooth connection slot and can prevent the Fluval app or gateway from connecting. Default: 120 s.",
           "expected_mode": "The mode the guardian keeps the fixture in. Auto/Professional enforce the matching onboard schedule and clock; Manual keeps the fixture in Manual mode; Unsupervised reports status only and never writes to the fixture. Default: Auto.",
           "check_interval_min": "How often the guardian checks the fixture's mode, clock, and schedule, in addition to checking right after every reconnect. Default: 10.",
           "override_return_min": "How long a manual channel, effect, or light change from Home Assistant is allowed to hold Manual mode before the guardian restores the expected schedule mode. Use 0 to never auto-return - end the override with the Return to schedule button or action instead. Default: 60.",
@@ -104,9 +102,6 @@
     "switch": {
       "daylight_saving_time": {
         "name": "Daylight saving time"
-      },
-      "bluetooth_connection": {
-        "name": "Bluetooth connection"
       }
     },
     "light": {

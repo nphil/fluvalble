@@ -8,14 +8,7 @@ Per FluvalGuardian's frozen design (confirmed over hub):
 - Constructors mirror the existing `(device, attr)` entities with `guardian`
   appended: `FluvalGuardianStatusSensor(device, "guardian_status", guardian)`.
 - `create_entities(device, guardian=None)` on every affected platform adds
-  its guardian entity/entities only when a guardian is supplied — including
-  the `bluetooth_connection` switch, bundled under the same flag so the
-  base's existing `switch.create_entities(device)` (positional, no guardian)
-  keeps returning exactly the daylight-saving switch it does today.
-- `FluvalBluetoothConnectionSwitch(device, "bluetooth_connection")` itself
-  still takes NO guardian argument — it is a plain `FluvalEntity` wrapping
-  `device.hold_connection` directly; only the create_entities() gate cares
-  about guardian presence.
+  its guardian entity/entities only when a guardian is supplied.
 """
 
 import asyncio
@@ -29,11 +22,11 @@ from homeassistant.components.sensor import SensorDeviceClass, SensorStateClass
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import issue_registry as ha_issue_registry
 
-from custom_components.fluvalble import binary_sensor, button, select, sensor, switch
+from custom_components.fluvalble import binary_sensor, button, select, sensor
 from custom_components.fluvalble.core.device import Device
 
 
-def _make_device(*, hold_connection=True, hass=None):
+def _make_device(*, hass=None):
     return Device(
         "AquaSky3.0_Test",
         hass=hass,
@@ -41,7 +34,6 @@ def _make_device(*, hold_connection=True, hass=None):
             "mac": "44:A6:E5:70:F1:8D",
             "model": "AquaSky Bluetooth LED",
             "product_id": 328,
-            "hold_connection": hold_connection,
         },
     )
 
@@ -286,69 +278,6 @@ def test_button_create_entities_without_guardian_matches_base_behavior():
 
     assert with_none == positional_only
     assert "return_to_schedule" not in positional_only
-
-
-# ---------------------------------------------------------------------------
-# switch.py — bluetooth_connection (device.hold_connection, no guardian arg)
-# ---------------------------------------------------------------------------
-
-
-def test_bluetooth_connection_switch_created_when_guardian_present():
-    device = _make_device()
-    guardian = _FakeGuardian()
-
-    entities = switch.create_entities(device, guardian)
-    conn_switches = [e for e in entities if getattr(e, "attr", None) == "bluetooth_connection"]
-
-    assert len(conn_switches) == 1
-
-
-def test_switch_create_entities_without_guardian_matches_base_behavior():
-    """The base's existing `switch.create_entities(device)` call keeps working."""
-    device = _make_device()
-
-    with_none = [getattr(e, "attr", None) for e in switch.create_entities(device, None)]
-    positional_only = [getattr(e, "attr", None) for e in switch.create_entities(device)]
-
-    assert with_none == positional_only
-    assert "bluetooth_connection" not in positional_only
-
-
-def test_bluetooth_connection_switch_reflects_hold_connection_state():
-    device = _make_device(hold_connection=True)
-    guardian = _FakeGuardian()
-    entity = next(e for e in switch.create_entities(device, guardian) if e.attr == "bluetooth_connection")
-
-    entity.internal_update()
-    assert entity._attr_is_on is True
-
-    device.hold_connection = False
-    entity.internal_update()
-    assert entity._attr_is_on is False
-
-
-def test_bluetooth_connection_switch_turn_on_off_writes_hold_connection():
-    device = _make_device(hold_connection=False)
-    guardian = _FakeGuardian()
-    entity = next(e for e in switch.create_entities(device, guardian) if e.attr == "bluetooth_connection")
-
-    asyncio.run(entity.async_turn_on())
-    assert device.hold_connection is True
-
-    asyncio.run(entity.async_turn_off())
-    assert device.hold_connection is False
-
-
-def test_bluetooth_connection_switch_is_always_available_even_when_unreachable():
-    device = _make_device()
-    device.connected = False
-    device.conn_info.pop("last_seen", None)
-    guardian = _FakeGuardian()
-    entity = next(e for e in switch.create_entities(device, guardian) if e.attr == "bluetooth_connection")
-
-    entity.internal_update()
-
-    assert entity._attr_available is True
 
 
 # ---------------------------------------------------------------------------

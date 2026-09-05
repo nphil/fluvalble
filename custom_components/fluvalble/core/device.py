@@ -15,12 +15,9 @@ from bleak import AdvertisementData, BLEDevice, BleakError, BleakScanner
 from homeassistant.components import bluetooth
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.event import async_track_point_in_time
-from homeassistant.util import dt as dt_util
 
 from . import (
-    CONF_HOLD_CONNECTION,
     CONF_LAMP_PROFILE,
-    DEFAULT_HOLD_CONNECTION,
     DEFAULT_LAMP_PROFILE,
     LAMP_PROFILE_AQUASKY,
     LAMP_PROFILE_AQUASKY3,
@@ -141,6 +138,18 @@ def _resolved_device_name(
         return ble_name
     return default_fixture_name(model)
 
+
+def _local_now() -> datetime:
+    """Return the local wall-clock time as the fixture's own clock knows it.
+
+    The clock-sync commands (``protocol.old_clock_packet``,
+    ``wifi_clock_packet``, ``mesh_clock_packet``) all write
+    ``datetime.now().astimezone()`` to the fixture, not Home Assistant's
+    configured time zone. Schedule interpolation must read the same clock
+    it wrote, or a container whose system time zone differs from HA's
+    configured one would render the wrong ramp position.
+    """
+    return datetime.now().astimezone()
 
 
 class Attribute(TypedDict, total=False):
@@ -268,7 +277,6 @@ class Device:
         self._commanded_at: float | None = None
         self._effect_restore_channels: dict[str, int] | None = None
         self._reachability_unsub: Callable[[], None] | None = None
-        self._hold_connection: bool = bool(config_data.get(CONF_HOLD_CONNECTION, DEFAULT_HOLD_CONNECTION))
         self._connection_listeners: list[Callable[[bool], None]] = []
         self._last_state_at: float | None = None
         self.mode_changed_by_write: bool = False
@@ -290,34 +298,6 @@ class Device:
     def controls_available(self) -> bool:
         """Return true when HA has enough BLE info to attempt commands."""
         return bool(self.client or self.conn_info.get("last_seen"))
-
-    @property
-    def hold_connection(self) -> bool:
-        """Return whether Home Assistant should hold the BLE connection open.
-
-        True keeps the GATT link up and reconnects on advertisement/backoff,
-        which is what lets the Guardian supervise the fixture continuously
-        with the lowest possible command latency. False (the default) is
-        connect-on-demand, not "parked": commands, clock syncs, and Guardian
-        checks still connect whenever they need to, and the client disconnects
-        again after `active_time` of inactivity. This light exposes only one
-        BLE central at a time, so holding the link permanently locks the
-        FluvalConnect app out - `False` trades a little latency on the next
-        command for leaving the single GATT slot free between checks.
-        """
-        return self._hold_connection
-
-    @hold_connection.setter
-    def hold_connection(self, value: bool) -> None:
-        """Switch between a permanently held link (True) and on-demand (False)."""
-        value = bool(value)
-        changed = value != self._hold_connection
-        self._hold_connection = value
-        if self.client is not None:
-            self.client.hold_connection = value
-        if changed:
-            for handler in self.updates_connect:
-                handler()
 
     def register_connection_listener(self, listener: Callable[[bool], None]) -> Callable[[], None]:
         """Subscribe to GATT connect/disconnect transitions.
@@ -451,17 +431,13 @@ class Device:
             advertisement.manufacturer_data,
         )
 
-        if self.client is None:
+        if self.client is not None:
             # Constructing a Client immediately spawns a real connect attempt
-            # (see Client.__init__), so only do that eagerly here when
-            # hold_connection asks for a permanently held link. When it is
-            # False (the default), the client is created on demand instead -
+            # (see Client.__init__), so this only refreshes an already-live
+            # client's BLE route; a new client is created on demand instead -
             # by the first guardian check or command that actually needs one
             # (`_async_ensure_client()`) - so an idle install never grabs the
             # single GATT slot on its own.
-            if self._hold_connection:
-                self.client = self._new_client(device)
-        else:
             self.client.device = device
 
         self._notify_diagnostics_throttled()
@@ -794,13 +770,22 @@ class Device:
     def scheduled_levels_now(self, now: datetime | None = None) -> list[int] | None:
         """Return the channel levels the fixture's onboard schedule implies right now.
 
-        Auto/Pro status bodies never carry live channel levels over classic
-        BLE, so ``values`` cannot answer "what is the fixture doing right
-        now" while the fixture is off BLE and coasting on its own clock.
-        This derives that answer from the last schedule readback using the
-        same interpolation the native ``680B`` preview command uses, driven
-        by Home Assistant's local clock (the fixture's own clock is synced
-        to it on every connect).
+        Classic BLE status bodies never carry live channel levels while a
+        fixture runs Auto or Professional onboard, so ``values`` cannot
+        answer "what is the fixture doing right now" while the fixture is
+        off BLE and coasting on its own clock. This derives that answer
+        from the last schedule readback using the same interpolation the
+        native ``680B`` preview command uses, driven by local wall-clock
+        time - the same clock the fixture's own clock-sync commands write
+        to it with (``protocol.old_clock_packet`` et al. use
+        ``datetime.now().astimezone()``, not Home Assistant's configured
+        time zone).
+
+        The FACEBD/Wi-Fi and Plant Pro (mesh/SPP) protocols already report
+        live channel levels over BLE regardless of mode, and store their
+        schedule readbacks in shapes this classic-only interpolation does
+        not understand (HH:MM-keyed points, not minute-keyed ones) - this
+        is never applicable to them.
         """
         mode = self.values.get("mode")
         if mode == "automatic":
@@ -809,25 +794,32 @@ class Device:
             schedule_type, schedule_key = "professional", "native_pro_schedule"
         else:
             return None
+        if self._uses_wifi_protocol() or self._uses_plant_pro_protocol():
+            return None
         if not self.values.get(schedule_key):
             return None
-        moment = now if now is not None else dt_util.now()
+        moment = now if now is not None else _local_now()
         minute = moment.hour * 60 + moment.minute
-        return self._classic_native_preview_levels(schedule_type, minute)
+        # A malformed/incomplete readback is reported once, from the code
+        # path that actually acts on it (the native preview command); this
+        # read-only display path must not re-report it on every render.
+        return self._classic_native_preview_levels(schedule_type, minute, report_error=False)
 
     def effective_levels(self) -> tuple[list[int] | None, str]:
         """Return the levels actually driving the fixture right now, and their source.
 
-        Manual mode reports live channel_N values over BLE ('reported').
-        Auto/Pro modes do not; what the fixture is doing is derived from its
-        onboard schedule instead ('schedule'), or is 'unknown' until that
-        schedule has been read back at least once.
+        Manual mode, and every mode on the FACEBD/Wi-Fi and Plant Pro
+        protocols, report live channel_N values over BLE ('reported').
+        Classic Auto/Pro modes do not; what the fixture is doing is derived
+        from its onboard schedule instead ('schedule'), or is 'unknown'
+        until that schedule has been read back at least once.
         """
         if self.values.get("mode") in ("automatic", "professional"):
             scheduled = self.scheduled_levels_now()
             if scheduled is not None:
                 return scheduled, "schedule"
-            return None, "unknown"
+            if not (self._uses_wifi_protocol() or self._uses_plant_pro_protocol()):
+                return None, "unknown"
         return [int(self.values.get(channel, 0)) for channel in self.numbers()], "reported"
 
     def channels_from_aquasky_rgb(
@@ -1328,8 +1320,6 @@ class Device:
             extra = dict(self.conn_info)
             extra["gatt_connected"] = self.connected
             return Attribute(is_on=self.is_reachable(), extra=extra)
-        if attr == "bluetooth_connection":
-            return Attribute(is_on=self.hold_connection)
         if attr.startswith("channel_"):
             return Attribute(min=0, max=100, step=1, value=self.values[attr])
         if attr == "mode":
@@ -1362,7 +1352,7 @@ class Device:
 
     def register_update(self, attr: str, handler: Callable):
         """Register handlers for updates."""
-        if attr in ("connection", "rssi", "last_seen", "active_connection_source", "bluetooth_connection"):
+        if attr in ("connection", "rssi", "last_seen", "active_connection_source"):
             self.updates_connect.append(handler)
         else:
             self.updates_component.append(handler)
@@ -1371,7 +1361,7 @@ class Device:
         """Remove a previously registered update handler."""
         target = (
             self.updates_connect
-            if attr in ("connection", "rssi", "last_seen", "active_connection_source", "bluetooth_connection")
+            if attr in ("connection", "rssi", "last_seen", "active_connection_source")
             else self.updates_component
         )
         with contextlib.suppress(ValueError):
@@ -1775,7 +1765,9 @@ class Device:
             for channel in NUMBERS
         }
 
-    def _classic_native_preview_levels(self, schedule_type: str, minute: int) -> list[int] | None:
+    def _classic_native_preview_levels(
+        self, schedule_type: str, minute: int, *, report_error: bool = True
+    ) -> list[int] | None:
         """Calculate the APK's classic ``680B`` values from fixture readback."""
         if schedule_type == "professional":
             raw_points = self.values.get("native_pro_schedule")
@@ -1793,10 +1785,11 @@ class Device:
             points = self._classic_auto_preview_points(self.values.get("native_auto_schedule"))
 
         if len(points) < 2:
-            self._set_diagnostic_error(
-                "native_preview_unavailable",
-                f"The fixture did not report a complete {schedule_type.title()} schedule",
-            )
+            if report_error:
+                self._set_diagnostic_error(
+                    "native_preview_unavailable",
+                    f"The fixture did not report a complete {schedule_type.title()} schedule",
+                )
             return None
         points.sort(key=lambda point: point["minute"])
         channels = self._interpolate_schedule(points, minute)
@@ -2387,8 +2380,8 @@ class Device:
 
         Bypasses `async_refresh_state`'s HA-bluetooth-component device lookup
         once a client already exists, reusing Client's own device_provider-
-        based route refresh directly. The very first call (no client yet -
-        connect-on-demand, `hold_connection` False) goes through
+        based route refresh directly. The very first call (no client yet,
+        connect-on-demand) goes through
         `_async_ensure_client()` once to create one; every call after that
         talks to `self.client` directly.
         """
@@ -2440,7 +2433,6 @@ class Device:
             "connection_options": {
                 "ping_interval": self._ping_interval,
                 "active_time": self._active_time,
-                "hold_connection": self._hold_connection,
             },
             "values": dict(self.values),
             "connection_info": dict(self.conn_info),
@@ -2502,7 +2494,6 @@ class Device:
             self.decode_update_packet,
             ping_interval=self._ping_interval,
             active_time=self._active_time,
-            hold_connection=self._hold_connection,
             device_provider=self._connectable_ble_device,
             connection_ready_callback=self._record_active_connection_source,
             ready_callback=self._async_on_client_ready,
@@ -2512,10 +2503,10 @@ class Device:
     async def _async_ensure_client(self) -> bool:
         """Create or refresh a client using HA's best connectable BLE route.
 
-        Always allowed to connect - `hold_connection = False` no longer means
-        "refuse every connection"; it only governs whether the resulting
-        session is kept open indefinitely once established (see
-        `Client._persistent()`).
+        Always allowed to connect - this is the sole place a `Client` is
+        created, so a Guardian check or command on an idle install connects
+        on demand instead of the fixture's single BLE slot being grabbed
+        eagerly at startup.
         """
         if not self.address:
             return False

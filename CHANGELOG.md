@@ -5,6 +5,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.1.0]
+
+### Removed
+
+- **`hold_connection` and the whole "hold Bluetooth connection" concept are
+  gone.** The `switch.<device>_bluetooth_connection` entity, the
+  `hold_connection` options-flow field, `Device.hold_connection` /
+  `Client.hold_connection`, and the advertisement-wakeup/backoff reconnect
+  supervisor they drove have all been removed - they added a confusing
+  second connection-policy knob without a real use case. Connection policy
+  is now the base's connect-on-demand only: `Client`'s finite `active_time`
+  idle window, as it worked before this fork. The upstream `active_time`
+  option (including `0` meaning a persistent connection) is unchanged -
+  that behaviour is upstream's, not this fork's.
+
+### Changed
+
+- `Device.update_ble()` no longer eagerly creates a `Client` on the first
+  advertisement; a client is now always created on demand, by the first
+  command or Guardian check that needs one.
+
 ## [1.0.3]
 
 ### Fixed

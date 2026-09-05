@@ -31,7 +31,6 @@ from .core import (
     CONF_ALERT_AFTER_FAILURES,
     CONF_CHECK_INTERVAL_MIN,
     CONF_EXPECTED_MODE,
-    CONF_HOLD_CONNECTION,
     CONF_LAMP_PROFILE,
     CONF_OVERRIDE_RETURN_MIN,
     CONF_PING_INTERVAL,
@@ -39,7 +38,6 @@ from .core import (
     DEFAULT_ALERT_AFTER_FAILURES,
     DEFAULT_CHECK_INTERVAL_MIN,
     DEFAULT_EXPECTED_MODE,
-    DEFAULT_HOLD_CONNECTION,
     DEFAULT_LAMP_PROFILE,
     DEFAULT_OVERRIDE_RETURN_MIN,
     DEFAULT_PING_INTERVAL,
@@ -98,7 +96,6 @@ OPTIONS_SCHEMA = vol.Schema(
                 LAMP_PROFILE_AQUASKY3: "AquaSky 3.0 / FACEBD (4-channel RGBW)",
             }
         ),
-        vol.Optional(CONF_HOLD_CONNECTION, default=DEFAULT_HOLD_CONNECTION): bool,
         vol.Optional(CONF_PING_INTERVAL, default=DEFAULT_PING_INTERVAL): vol.All(
             int,
             vol.Range(min=5, max=60),
@@ -191,14 +188,14 @@ def _device_display_name(
         adv = service_info.advertisement
         local_name = ((adv.local_name if adv else None) or "").strip()
         address = getattr(service_info, "address", "") or ""
+        if local_name and not is_bare_address_name(local_name, address):
+            name = local_name
+        elif is_fluval:
+            name = default_fixture_name(detect_model(local_name, adv))
+        else:
+            name = "Unknown device"
     except Exception:  # noqa: BLE001
         return "Unknown device"
-    if local_name and not is_bare_address_name(local_name, address):
-        name = local_name
-    elif is_fluval:
-        name = default_fixture_name(detect_model(local_name, adv))
-    else:
-        name = "Unknown device"
     return f"{name} ({address})"
 
 

@@ -10,14 +10,6 @@
         "default": "mdi:calendar-sync-outline"
       }
     },
-    "switch": {
-      "bluetooth_connection": {
-        "default": "mdi:bluetooth-connect",
-        "state": {
-          "off": "mdi:bluetooth-off"
-        }
-      }
-    },
     "sensor": {
       "guardian_status": {
         "default": "mdi:shield-check-outline",

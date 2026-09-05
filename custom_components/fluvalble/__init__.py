@@ -651,25 +651,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: FluvalConfigEntry) -> bo
         )
     )
 
-    @callback
-    def _on_advertisement_seen(
-        service_info: bluetooth.BluetoothServiceInfoBleak,
-        change: bluetooth.BluetoothChange,
-    ) -> None:
-        """Wake a backed-off reconnect wait the moment the fixture is heard again."""
-        del change
-        if (device := runtime.device) is not None and device.client is not None:
-            device.client.notify_advertisement_seen()
-
-    entry.async_on_unload(
-        bluetooth.async_register_callback(
-            hass,
-            _on_advertisement_seen,
-            {"address": mac},
-            bluetooth.BluetoothScanningMode.PASSIVE,
-        )
-    )
-
     if hass.state is CoreState.running:
         create_runtime_task(_async_migrate_legacy_auto_schedule(hass, entry.entry_id))
     else:

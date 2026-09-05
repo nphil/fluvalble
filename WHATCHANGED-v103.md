@@ -10,15 +10,36 @@ schedule at full midday output was shown as off with every channel at zero.
 
 **Fix:**
 - `custom_components/fluvalble/core/device.py`
-  - Added `Device.scheduled_levels_now(now=None) -> list[int] | None`: in
-    `automatic`/`professional` mode, with a matching native schedule
+  - Added `Device.scheduled_levels_now(now=None) -> list[int] | None`: for a
+    classic-protocol fixture (never FACEBD/Wi-Fi or Plant Pro - see below)
+    in `automatic`/`professional` mode with a matching native schedule
     readback present, returns `_classic_native_preview_levels(schedule_type,
-    minute)` for the given (or current, via `homeassistant.util.dt.now()`)
-    local time; `None` in manual mode or without a readback.
+    minute, report_error=False)` for the given (or current) local time;
+    `None` in manual mode, without a readback, or on the FACEBD/Wi-Fi or
+    Plant Pro protocols. The default clock is `datetime.now().astimezone()`
+    (a new `_local_now()` helper), matching what the clock-sync commands
+    (`protocol.old_clock_packet`/`wifi_clock_packet`/`mesh_clock_packet`)
+    actually write to the fixture - not `homeassistant.util.dt.now()`,
+    which is Home Assistant's configured time zone and can differ from the
+    host's system time zone that those commands use.
+  - `_classic_native_preview_levels()` gained a `report_error: bool = True`
+    keyword: the native-preview command path (unchanged) still records a
+    diagnostic on an incomplete schedule; `scheduled_levels_now()` passes
+    `report_error=False` so a read-only render (called up to once a minute)
+    never repeatedly overwrites diagnostics for the same stale condition.
+  - `scheduled_levels_now()`/`effective_levels()` only apply this
+    interpolation to the classic protocol. FACEBD/Wi-Fi and Plant Pro
+    (mesh/SPP) status updates already report live `channel_N` values
+    regardless of mode (unlike classic, which never does in Auto/Pro), and
+    their own schedule readbacks are shaped differently (HH:MM-keyed
+    points/strings, not the classic minute-keyed points), so
+    `effective_levels()` reports `"reported"` for those protocols in every
+    mode rather than guessing from a schedule shape this code cannot parse.
   - Added `Device.effective_levels() -> tuple[list[int] | None, str]`:
-    `(reported values, "reported")` in manual mode; `(scheduled levels,
-    "schedule")` in Auto/Pro with a readback; `(None, "unknown")` in Auto/Pro
-    without one yet.
+    `(reported values, "reported")` in manual mode (and in every mode on
+    FACEBD/Wi-Fi or Plant Pro); `(scheduled levels, "schedule")` for a
+    classic fixture in Auto/Pro with a readback; `(None, "unknown")` for a
+    classic fixture in Auto/Pro without one yet.
   - `master_brightness`, `light_brightness_255`, `light_rgb_255`, and
     `aquasky_rgb_255` gained an optional `levels` override parameter so the
     light entity can render explicit schedule-derived levels while every
@@ -49,11 +70,14 @@ schedule at full midday output was shown as off with every channel at zero.
 `Device.scheduled_levels_now`/`effective_levels` interpolation at 06:30
 (sunrise-ramp midpoint), 12:00 (day levels), 20:00 (night levels), and 23:00
 (off, past sleep), using the exact real-world readback from the bug report;
-`effective_levels` in Manual/unknown-Auto/Pro states; the light entity's
-`is_on`/`rgb_color`/`level_source`/`scheduled_levels` at noon and after
-sleep time in Auto mode; Manual mode ignoring a stale schedule readback; and
-the re-render tick's registration (marked `_hass_callback`), invocation, and
-unregistration on removal.
+`effective_levels` in Manual/unknown-Auto/Pro states; a malformed/incomplete
+classic schedule not writing to `diagnostics` from the read-only render
+path; FACEBD/Wi-Fi and Plant Pro protocols staying `"reported"` in Auto/Pro
+instead of guessing from a schedule shape they don't use; the light
+entity's `is_on`/`rgb_color`/`level_source`/`scheduled_levels` at noon and
+after sleep time in Auto mode; Manual mode ignoring a stale schedule
+readback; and the re-render tick's registration (marked `_hass_callback`),
+invocation, and unregistration on removal.
 
 ## 2. Fixtures are named after their model, not their MAC address (scope
    added mid-session by the user via the orchestrating agent)
@@ -80,6 +104,9 @@ manufacturer data.
     `local_name` only when it is non-empty and not a bare-address name;
     otherwise, for a Fluval-identified advertisement, it resolves the model
     via `detect_model()` and falls back to `default_fixture_name(model)`.
+    The model lookup runs inside the function's existing `except Exception`
+    guard, so a malformed advertisement still degrades to one
+    "Unknown device" row instead of breaking the whole discovery dropdown.
   - Added `_default_title_for_model(hass, model, mac)`: returns
     `default_fixture_name(model)`, or that name suffixed with `(<last two
     MAC octets>)` if another already-configured entry (`entry.data["model"]`)
@@ -126,10 +153,20 @@ manufacturer data.
 - `custom_components/fluvalble/manifest.json`: version bumped to `1.0.3`.
 - `CHANGELOG.md`: added a `## [1.0.3]` section for both fixes.
 - `docs/releases/v1.0.3.md`: added, starting with the required
-  `# Fluval BLE v1.0.3` line.
+  `# Fluval BLE v1.0.3` line. Its Upgrade notes are precise about what the
+  naming fix does for an *existing* install: `Device.__init__` recomputes
+  `self.name` from `entry.title`/`self.model` on every setup, so an
+  existing MAC-titled fixture's device-registry name (and entity friendly
+  names) self-corrects on the next restart; the stored config-entry title
+  and any already-assigned `entity_id`s are untouched.
+
 
 ## Verification
 
 `uv run --python 3.13 --with pytest --with pytest-asyncio --with bleak --with bleak-retry-connector --with voluptuous --with homeassistant python -m pytest tests -q`
-→ 787 passed (765 baseline − 2 deleted incidental tests + 24 new). `python
--m py_compile` clean on every changed module.
+→ 787 passed (765 baseline − 2 deleted incidental tests + 24 new), plus 5
+more added after review (protocol-gating and diagnostic-noise fixes above);
+final count pending one more full run - a sibling agent (`FluvalRemoveHold`)
+is concurrently removing the unrelated `hold_connection` feature from the
+same working tree and briefly left it non-importable mid-edit. `python -m
+py_compile` is clean on every file this ticket touches.

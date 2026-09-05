@@ -338,8 +338,7 @@ def test_light_renders_scheduled_levels_at_noon_in_automatic_mode():
     device.values["native_auto_schedule"] = dict(_REAL_AUTO_SCHEDULE_READBACK)
     entity = light.FluvalLight(device, "light")
 
-    with patch("custom_components.fluvalble.core.device.dt_util") as dt_util:
-        dt_util.now.return_value = datetime(2026, 9, 5, 12, 0)
+    with patch("custom_components.fluvalble.core.device._local_now", return_value=datetime(2026, 9, 5, 12, 0)):
         entity.internal_update()
 
     assert entity._attr_is_on is True
@@ -355,8 +354,7 @@ def test_light_is_off_once_the_schedule_reaches_sleep_time():
     device.values["native_auto_schedule"] = dict(_REAL_AUTO_SCHEDULE_READBACK)
     entity = light.FluvalLight(device, "light")
 
-    with patch("custom_components.fluvalble.core.device.dt_util") as dt_util:
-        dt_util.now.return_value = datetime(2026, 9, 5, 23, 0)
+    with patch("custom_components.fluvalble.core.device._local_now", return_value=datetime(2026, 9, 5, 23, 0)):
         entity.internal_update()
 
     assert entity._attr_is_on is False
@@ -377,8 +375,7 @@ def test_light_in_manual_mode_ignores_a_stale_schedule_and_uses_reported_values(
     device.values["native_auto_schedule"] = dict(_REAL_AUTO_SCHEDULE_READBACK)
     entity = light.FluvalLight(device, "light")
 
-    with patch("custom_components.fluvalble.core.device.dt_util") as dt_util:
-        dt_util.now.return_value = datetime(2026, 9, 5, 23, 0)
+    with patch("custom_components.fluvalble.core.device._local_now", return_value=datetime(2026, 9, 5, 23, 0)):
         entity.internal_update()
 
     assert entity._attr_is_on is True
@@ -417,8 +414,7 @@ def test_light_registers_a_60s_schedule_rerender_tick_marked_for_loop_dispatch()
 
         device.values["mode"] = "automatic"
         device.values["native_auto_schedule"] = dict(_REAL_AUTO_SCHEDULE_READBACK)
-        with patch("custom_components.fluvalble.core.device.dt_util") as dt_util:
-            dt_util.now.return_value = datetime(2026, 9, 5, 12, 0)
+        with patch("custom_components.fluvalble.core.device._local_now", return_value=datetime(2026, 9, 5, 12, 0)):
             captured["action"]()
         assert entity._attr_extra_state_attributes["level_source"] == "schedule"
 

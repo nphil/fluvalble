@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import random
 from collections.abc import Awaitable, Callable
 import contextlib
 import logging
@@ -28,9 +27,6 @@ POST_WRITE_STATE_DELAY = 0.8
 STATE_NOTIFY_TIMEOUT = 0.75
 UNVERIFIED_WRITE_COPIES = 2
 CHUNK_WRITE_GAP = 0.01
-
-RECONNECT_BACKOFF_MIN = 2.0
-RECONNECT_BACKOFF_MAX = 120.0
 
 # Hardware capture from AquaSky 3.0 establishes this FACEBD split:
 #   facebd01 = raw CBOR command writes
@@ -76,19 +72,6 @@ ConnectionReadyCallback = Callable[[BLEDevice, str | None], None]
 StateReadyCallback = Callable[[dict[int, object]], Awaitable[None]]
 
 
-def reconnect_backoff_seconds(attempt: int) -> float:
-    """Return a jittered persistent-reconnect delay, capped at 120 seconds.
-
-    ``attempt`` is the number of consecutive failed (re)connect attempts.
-    The first failure always waits exactly ``RECONNECT_BACKOFF_MIN`` seconds;
-    later attempts grow exponentially with full jitter down to that floor,
-    saturating at ``RECONNECT_BACKOFF_MAX``.
-    """
-    attempt = max(1, int(attempt))
-    base = min(RECONNECT_BACKOFF_MAX, RECONNECT_BACKOFF_MIN * (2 ** (attempt - 1)))
-    return random.uniform(RECONNECT_BACKOFF_MIN, base)
-
-
 class Client:
     """Basic client handling BLE sending and callbacks."""
 
@@ -103,7 +86,6 @@ class Client:
         connection_ready_callback: ConnectionReadyCallback | None = None,
         ready_callback: Callable[[], Awaitable[None]] | None = None,
         state_ready_callback: StateReadyCallback | None = None,
-        hold_connection: bool = False,
     ) -> None:
         """Initialize the client."""
         self.device = device
@@ -115,9 +97,6 @@ class Client:
         self.state_ready_callback = state_ready_callback
         self._ping_interval = ping_interval
         self._active_time = active_time
-        self._hold_connection = hold_connection
-        self._advertisement_event = asyncio.Event()
-        self._reconnect_failures = 0
         self.connection_attempts = 0
 
         self.client: BleakClient | None = None
@@ -365,7 +344,7 @@ class Client:
         if self.ping_future:
             self.ping_future.cancel()
 
-        if self._stopping or not self._persistent():
+        if self._stopping or self._active_time != 0:
             return
         if not self.ping_task or self.ping_task.done():
             self.ping()
@@ -389,55 +368,13 @@ class Client:
 
     def ping(self):
         """Start the ping task to periodically talk to the Fluval."""
-        if self._persistent():
+        if self._active_time == 0:
             self.ping_time = float("inf")
         else:
             self.ping_time = time.time() + self._active_time
 
         if not self.ping_task:
             self.ping_task = asyncio.create_task(self._ping_loop())
-
-    def _persistent(self) -> bool:
-        """Return whether the client should hold and repair the connection.
-
-        True when either the legacy ``active_time == 0`` convention or the
-        newer, independent ``hold_connection`` flag asks for a persistent
-        link; either one is sufficient.
-        """
-        return self._active_time == 0 or self._hold_connection
-
-    @property
-    def hold_connection(self) -> bool:
-        """Return whether Home Assistant should hold the GATT link open."""
-        return self._hold_connection
-
-    @hold_connection.setter
-    def hold_connection(self, value: bool) -> None:
-        """Resume or pause the persistent-reconnect supervisor.
-
-        Resuming wakes an in-progress backoff wait and restarts the
-        supervisor immediately. Pausing collapses the idle deadline to now
-        and wakes the heartbeat so the existing idle-disconnect path takes
-        the connection down right away, reusing already-tested machinery
-        instead of spawning a separate disconnect task.
-        """
-        value = bool(value)
-        if value == self._hold_connection:
-            return
-        self._hold_connection = value
-        self._reconnect_failures = 0
-        self._advertisement_event.set()
-        if value:
-            if not self._stopping:
-                self.ping()
-        else:
-            self.ping_time = 0
-            if self.ping_future:
-                self.ping_future.cancel()
-
-    def notify_advertisement_seen(self) -> None:
-        """Wake a backed-off reconnect wait now; safe to call at any time."""
-        self._advertisement_event.set()
 
     def _dispatch_update(self, data: bytes) -> bool:
         """Decode an update and signal waiters only for valid state packets."""
@@ -493,7 +430,7 @@ class Client:
             if self.status_callback:
                 self.status_callback(False)
         finally:
-            if not self._stopping and (connected or self._persistent()):
+            if not self._stopping and (connected or self._active_time == 0):
                 self.ping()
 
     async def _initialize_session(self, client: BleakClient) -> bool:
@@ -548,7 +485,6 @@ class Client:
                     client = await self._ensure_client()
                 if not await self._initialize_session(client):
                     raise BleakError("Fluval BLE session initialization failed")
-                self._reconnect_failures = 0
 
                 # heartbeat loop
                 while time.time() < self.ping_time and not self._stopping and client is self.client:
@@ -589,15 +525,7 @@ class Client:
             except Exception as e:
                 _LOGGER.warning("ping error", exc_info=e)
             if not self._stopping and time.time() < self.ping_time:
-                if self._persistent():
-                    self._reconnect_failures += 1
-                    delay = reconnect_backoff_seconds(self._reconnect_failures)
-                    with contextlib.suppress(TimeoutError):
-                        async with asyncio.timeout(delay):
-                            await self._advertisement_event.wait()
-                    self._advertisement_event.clear()
-                else:
-                    await asyncio.sleep(1)
+                await asyncio.sleep(1)
 
         self.ping_task = None
 

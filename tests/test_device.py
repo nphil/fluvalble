@@ -1926,10 +1926,55 @@ def test_scheduled_levels_now_is_none_in_manual_mode():
     assert device.scheduled_levels_now(now=datetime(2026, 9, 5, 12, 0)) is None
 
 
+def test_scheduled_levels_now_does_not_spam_diagnostics_for_an_incomplete_schedule():
+    """A malformed/incomplete readback is a diagnostic concern for the code
+    path that acts on it (the native preview command), not for this
+    read-only render path, which may be called every 60s."""
+    device = _make_device(name="AquaSky2.0_Test", model="AquaSky 2.0 Bluetooth LED", product_id=328)
+    device.values["mode"] = "automatic"
+    device.values["native_auto_schedule"] = {"sunrise": {"hour": 6, "minute": 0}}
+    before = dict(device.diagnostics)
+
+    assert device.scheduled_levels_now(now=datetime(2026, 9, 5, 12, 0)) is None
+
+    assert device.diagnostics == before
+
+
+def test_scheduled_levels_now_is_none_for_wifi_facebd_protocol_in_automatic_mode():
+    """FACEBD/Wi-Fi status updates already report live channel levels in
+    every mode, and its schedule shapes differ from the classic ones this
+    interpolation understands - never applicable here."""
+    device = _auto_device_with_real_readback()
+    device.facebd = True
+    assert device.scheduled_levels_now(now=datetime(2026, 9, 5, 12, 0)) is None
+
+
+def test_scheduled_levels_now_is_none_for_plant_pro_protocol_in_automatic_mode():
+    device = _auto_device_with_real_readback()
+    device.client = SimpleNamespace(plant_pro_spp=True)
+    assert device.scheduled_levels_now(now=datetime(2026, 9, 5, 12, 0)) is None
+
+
+def test_effective_levels_stays_reported_for_wifi_protocol_in_automatic_mode():
+    device = _auto_device_with_real_readback()
+    device.facebd = True
+    device.values["channel_1"] = 42
+    assert device.effective_levels() == ([42, 0, 0, 0], "reported")
+
+
+def test_effective_levels_stays_reported_for_plant_pro_protocol_in_professional_mode():
+    device = _make_device(name="PlantPro_AABBCC", model="Plant Pro 4.0 Bluetooth LED", product_id=545)
+    device.client = SimpleNamespace(plant_pro_spp=True)
+    device.values["mode"] = "professional"
+    device.values["native_pro_schedule"] = [{"time": "12:30", "levels": [10, 20, 30, 40, 50]}]
+    device.values["channel_1"] = 7
+    assert device.effective_levels() == ([7, 0, 0, 0, 0], "reported")
+
+
+
 def test_effective_levels_uses_schedule_in_automatic_mode():
     device = _auto_device_with_real_readback()
-    with patch("custom_components.fluvalble.core.device.dt_util") as dt_util:
-        dt_util.now.return_value = datetime(2026, 9, 5, 12, 0)
+    with patch("custom_components.fluvalble.core.device._local_now", return_value=datetime(2026, 9, 5, 12, 0)):
         assert device.effective_levels() == ([68, 100, 100, 90], "schedule")
 
 

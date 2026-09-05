@@ -132,16 +132,12 @@ Open the integration's **Configure** dialog to adjust its BLE connection behavio
 The **Active connection window** accepts `0` for a persistent connection or
 `30`–`600` seconds for an idle timeout. Persistent mode provides the lowest
 command latency and reconnects immediately after an unexpected drop. A finite
-window releases the Bluetooth connection when idle so the official Fluval app
-or a Fluval gateway can connect. The backward-compatible default is `120`
-seconds.
-
-**Hold Bluetooth connection** (off by default) asks Home Assistant to keep
-the GATT link open permanently and reconnect automatically, instead of
-connecting on demand for commands and for the guardian's periodic checks and
-disconnecting again after the active connection window. Same control as the
-**Bluetooth connection** switch - see
-[Schedule Guardian & connection sharing](#schedule-guardian--connection-sharing).
+window (the backward-compatible default, `120` seconds) releases the
+connection when idle so the official Fluval app or a Fluval gateway can
+connect - there is nothing to do in the app itself; Home Assistant simply
+lets go of the single BLE slot once the idle window elapses, and reconnects
+on demand the next time a command or a Schedule Guardian check needs the
+fixture.
 
 Some newer fixtures, including Plant PRO and Plant 4.0, permit only one
 Bluetooth controller at a time. Persistent mode therefore prevents the official
@@ -217,17 +213,14 @@ problem turns on and Home Assistant opens a repair notification. Call
 `fluvalble.guardian_check_now` to force an immediate check outside the normal
 interval.
 
-**Sharing the connection deliberately.** Home Assistant connects **on
-demand** by default (v1.0.1+): for commands and for the guardian's periodic
-checks, then disconnects again after the active connection window, leaving
-the fixture's single BLE slot free for the Fluval app the rest of the time.
-The **Bluetooth connection** switch (or the `hold_connection` option) lets
-you ask Home Assistant to hold that connection open permanently instead, for
-the lowest possible command latency, at the cost of locking out the app (or
-any other controller) until it's turned back off. Either way, the guardian
-keeps checking and correcting on its normal schedule - only
-`expected_mode: unsupervised` pauses its corrections (it still connects for
-visibility, but never writes to the fixture).
+**Sharing the connection.** Home Assistant connects **on demand** for
+commands and for the guardian's periodic checks, then disconnects again
+after the active connection window, leaving the fixture's single BLE slot
+free for the Fluval app the rest of the time - there is nothing to do in the
+app itself, the link is simply released once Home Assistant is done with
+it. The guardian keeps checking and correcting on its normal schedule
+regardless - only `expected_mode: unsupervised` pauses its corrections (it
+still connects for visibility, but never writes to the fixture).
 
 Configure `expected_mode`, `check_interval_min`, `override_return_min`, and
 `alert_after_failures` from the integration's **Configure** dialog. Set
@@ -251,7 +244,6 @@ After setup you'll see one device with entities like:
 | **Button** | Sync Clock | Synchronizes the fixture's real-time clock with Home Assistant. |
 | **Button** | Return to schedule | Ends an active manual override immediately instead of waiting for the return timer. |
 | **Switch** | Daylight saving time | Onboard setting available on supported AquaSky 3.0 fixtures. |
-| **Switch** | Bluetooth connection | Always available. Holds or releases Home Assistant's single BLE connection slot on demand - see [Schedule Guardian](#schedule-guardian--connection-sharing). |
 
 Entity IDs follow the pattern `<platform>.fluval_<mac_without_colons>_<name>`, for example `light.fluval_aabbccddeeff_light`. You can find the exact IDs in **Settings → Devices & services → Fluval Aquarium LED → entities**.
 If a light, mode, daylight-saving, Identify, or Sync clock command cannot reach
