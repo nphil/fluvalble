@@ -437,7 +437,13 @@ async def _async_test_native_weather_effect_uses_apk_packet():
         }
     )
     device._async_prepare_command = AsyncMock(return_value=True)
-    device._async_send_packet = AsyncMock(return_value=True)
+
+    async def send_packet(packet):
+        if packet[:2] == bytes((0x68, protocol.OLD_MODE)):
+            device.values["mode"] = "manual"
+        return True
+
+    device._async_send_packet = AsyncMock(side_effect=send_packet)
 
     assert await device.async_set_effect("Lightning")
 
@@ -476,6 +482,8 @@ async def _async_test_complete_device_commands_cannot_interleave_packets():
 
     async def send_packet(packet):
         packets.append(packet)
+        if packet[:2] == bytes((0x68, protocol.OLD_MODE)):
+            device.values["mode"] = "manual"
         if len(packets) == 1:
             first_packet_started.set()
             await release_first_packet.wait()
@@ -609,7 +617,13 @@ async def _async_test_plant_pro_native_effect_uses_key_14_packet():
     )
     device.values.update({"mode": "automatic", "led_on_off": False})
     device._async_prepare_command = AsyncMock(return_value=True)
-    device._async_send_packet = AsyncMock(return_value=True)
+
+    async def send_packet(packet):
+        if packet == protocol.spp_mode_packet(0):
+            device.values["mode"] = "manual"
+        return True
+
+    device._async_send_packet = AsyncMock(side_effect=send_packet)
 
     assert await device.async_set_effect("Sun and lightning")
     assert [call.args[0] for call in device._async_send_packet.await_args_list] == [
@@ -642,7 +656,13 @@ async def _async_test_facebd_native_effect_uses_apk_key_109_packet():
         }
     )
     device._async_prepare_command = AsyncMock(return_value=True)
-    device._async_send_packet = AsyncMock(return_value=True)
+
+    async def send_packet(packet):
+        if packet == protocol.wifi_mode_packet(0):
+            device.values["mode"] = "manual"
+        return True
+
+    device._async_send_packet = AsyncMock(side_effect=send_packet)
 
     assert await device.async_set_effect("Lightning")
     assert [call.args[0] for call in device._async_send_packet.await_args_list] == [
@@ -2149,7 +2169,12 @@ async def _async_test_set_channels_switches_to_manual_before_write():
     device = _make_device()
     device.values["mode"] = "automatic"
     device._async_prepare_command = AsyncMock(return_value=True)
-    device._async_send_packet = AsyncMock(return_value=True)
+
+    async def send_packet(_packet):
+        device.values["mode"] = "manual"
+        return True
+
+    device._async_send_packet = AsyncMock(side_effect=send_packet)
     device._async_send_channel_state = AsyncMock(return_value=True)
 
     assert await device.async_set_channels({"channel_1": 25})

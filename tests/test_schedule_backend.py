@@ -290,7 +290,7 @@ async def _async_test_service_without_target_rejects_ambiguous_fixtures():
 def test_service_descriptions_use_device_picker_and_fixture_language():
     source = (Path(__file__).parents[1] / "custom_components" / "fluvalble" / "services.yaml").read_text()
 
-    assert source.count("integration: fluvalble") == 10
+    assert source.count("integration: fluvalble") == 12
     assert "entry_id:" not in source
     assert "MAC address" not in source
     for internal_label in ("classic/OLD", "FACEBD", "FFF0", "SPP", "MESH", "product ID"):

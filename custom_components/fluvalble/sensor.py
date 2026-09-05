@@ -1,5 +1,7 @@
 """Sensor platform for Fluval Aquarium LED diagnostics."""
 
+from datetime import UTC, datetime
+
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory, Platform
@@ -8,14 +10,24 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from . import require_entry_runtime_data
 from .core.device import Device
-from .core.entity import FluvalEntity
+from .core.entity import FluvalEntity, FluvalGuardianEntity
+from .core.guardian import GUARDIAN_STATUSES, ScheduleGuardian
 
 PARALLEL_UPDATES = 0
 
 
-def create_entities(device: Device) -> list:
+def create_entities(device: Device, guardian: ScheduleGuardian | None = None) -> list:
     """Build the entity list for this platform."""
-    return [FluvalSensor(device, sensor) for sensor in device.sensors()]
+    entities: list = [FluvalSensor(device, sensor) for sensor in device.sensors()]
+    if guardian is not None:
+        entities.extend(
+            [
+                FluvalGuardianStatusSensor(device, "guardian_status", guardian),
+                FluvalGuardianLastCheckSensor(device, "guardian_last_check", guardian),
+                FluvalGuardianCorrectionsSensor(device, "guardian_corrections", guardian),
+            ]
+        )
+    return entities
 
 
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, add_entities: AddEntitiesCallback) -> None:
@@ -23,7 +35,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, add_
     device = runtime.device
 
     if device:
-        add_entities(create_entities(device))
+        add_entities(create_entities(device, runtime.guardian))
     else:
         runtime.pending_add_entities[Platform.SENSOR] = add_entities
 
@@ -63,5 +75,43 @@ class FluvalSensor(FluvalEntity, SensorEntity):
             self._attr_device_class = SensorDeviceClass.TIMESTAMP
         elif self.attr == "active_connection_source":
             self._attr_icon = "mdi:bluetooth"
+        if self.hass:
+            self._async_write_ha_state()
+
+
+class FluvalGuardianStatusSensor(FluvalGuardianEntity, SensorEntity):
+    """Reports ScheduleGuardian's outcome from its most recent check."""
+
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = list(GUARDIAN_STATUSES)
+
+    def internal_update(self) -> None:
+        """Update the sensor state from the guardian."""
+        self._attr_native_value = self.guardian.status
+        if self.hass:
+            self._async_write_ha_state()
+
+
+class FluvalGuardianLastCheckSensor(FluvalGuardianEntity, SensorEntity):
+    """Reports when ScheduleGuardian last completed a check."""
+
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+
+    def internal_update(self) -> None:
+        """Update the sensor state from the guardian."""
+        last_check_at = self.guardian.last_check_at
+        self._attr_native_value = datetime.fromtimestamp(last_check_at, tz=UTC) if last_check_at is not None else None
+        if self.hass:
+            self._async_write_ha_state()
+
+
+class FluvalGuardianCorrectionsSensor(FluvalGuardianEntity, SensorEntity):
+    """Counts corrections ScheduleGuardian has made since startup."""
+
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+
+    def internal_update(self) -> None:
+        """Update the sensor state from the guardian."""
+        self._attr_native_value = self.guardian.corrections
         if self.hass:
             self._async_write_ha_state()

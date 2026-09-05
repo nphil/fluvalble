@@ -28,12 +28,26 @@ from homeassistant.helpers.device_registry import format_mac
 from .core import (
     CONFIG_ENTRY_VERSION,
     CONF_ACTIVE_TIME,
+    CONF_ALERT_AFTER_FAILURES,
+    CONF_CHECK_INTERVAL_MIN,
+    CONF_EXPECTED_MODE,
+    CONF_HOLD_CONNECTION,
     CONF_LAMP_PROFILE,
+    CONF_OVERRIDE_RETURN_MIN,
     CONF_PING_INTERVAL,
     DEFAULT_ACTIVE_TIME,
+    DEFAULT_ALERT_AFTER_FAILURES,
+    DEFAULT_CHECK_INTERVAL_MIN,
+    DEFAULT_EXPECTED_MODE,
+    DEFAULT_HOLD_CONNECTION,
     DEFAULT_LAMP_PROFILE,
+    DEFAULT_OVERRIDE_RETURN_MIN,
     DEFAULT_PING_INTERVAL,
     DOMAIN,
+    EXPECTED_MODE_AUTO,
+    EXPECTED_MODE_MANUAL,
+    EXPECTED_MODE_PRO,
+    EXPECTED_MODE_UNSUPERVISED,
     LAMP_PROFILE_AQUASKY,
     LAMP_PROFILE_AQUASKY3,
     LAMP_PROFILE_AUTO,
@@ -77,6 +91,7 @@ OPTIONS_SCHEMA = vol.Schema(
                 LAMP_PROFILE_AQUASKY3: "AquaSky 3.0 / FACEBD (4-channel RGBW)",
             }
         ),
+        vol.Optional(CONF_HOLD_CONNECTION, default=DEFAULT_HOLD_CONNECTION): bool,
         vol.Optional(CONF_PING_INTERVAL, default=DEFAULT_PING_INTERVAL): vol.All(
             int,
             vol.Range(min=5, max=60),
@@ -86,6 +101,26 @@ OPTIONS_SCHEMA = vol.Schema(
         vol.Optional(CONF_ACTIVE_TIME, default=DEFAULT_ACTIVE_TIME): vol.All(
             int,
             vol.Range(min=0, max=600),
+        ),
+        vol.Optional(CONF_EXPECTED_MODE, default=DEFAULT_EXPECTED_MODE): vol.In(
+            {
+                EXPECTED_MODE_AUTO: "Auto - keep the fixture on its onboard Auto schedule",
+                EXPECTED_MODE_PRO: "Professional - keep the fixture on its onboard Professional schedule",
+                EXPECTED_MODE_MANUAL: "Manual - keep the fixture in Manual mode",
+                EXPECTED_MODE_UNSUPERVISED: "Unsupervised - report status only, never correct mode or schedule",
+            }
+        ),
+        vol.Optional(CONF_CHECK_INTERVAL_MIN, default=DEFAULT_CHECK_INTERVAL_MIN): vol.All(
+            int,
+            vol.Range(min=1, max=1440),
+        ),
+        vol.Optional(CONF_OVERRIDE_RETURN_MIN, default=DEFAULT_OVERRIDE_RETURN_MIN): vol.All(
+            int,
+            vol.Range(min=0, max=1440),
+        ),
+        vol.Optional(CONF_ALERT_AFTER_FAILURES, default=DEFAULT_ALERT_AFTER_FAILURES): vol.All(
+            int,
+            vol.Range(min=1, max=20),
         ),
     }
 )
@@ -384,7 +419,12 @@ class OptionsFlowHandler(OptionsFlowBase):
                     ),
                     errors={CONF_ACTIVE_TIME: "invalid_active_time"},
                 )
-            return self.async_create_entry(title="", data=user_input)
+            # Preserve options this form never shows - currently just the
+            # guardian's expected_schedule, written by the schedule-programming
+            # services/entities rather than this form. A plain `data=user_input`
+            # would silently wipe it on every options save.
+            merged = {**self._config_entry().options, **user_input}
+            return self.async_create_entry(title="", data=merged)
 
         return self.async_show_form(
             step_id="init",

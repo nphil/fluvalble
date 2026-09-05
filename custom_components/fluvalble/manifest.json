@@ -78,20 +78,20 @@
     }
   ],
   "codeowners": [
-    "@MrMooreUK"
+    "@nphil"
   ],
   "config_flow": true,
   "dependencies": [
     "bluetooth_adapters",
     "http"
   ],
-  "documentation": "https://github.com/MrMooreUK/fluvalble",
+  "documentation": "https://github.com/nphil/fluvalble",
   "integration_type": "device",
   "iot_class": "local_push",
-  "issue_tracker": "https://github.com/MrMooreUK/fluvalble/issues",
+  "issue_tracker": "https://github.com/nphil/fluvalble/issues",
   "loggers": [
     "custom_components.fluvalble"
   ],
   "requirements": [],
-  "version": "0.0.12"
+  "version": "1.0.0"
 }

@@ -39,13 +39,23 @@
         "title": "Connection options",
         "data": {
           "lamp_profile": "Lamp type",
+          "hold_connection": "Hold Bluetooth connection",
           "ping_interval": "Keep-alive interval (seconds)",
-          "active_time": "Active connection window (seconds)"
+          "active_time": "Active connection window (seconds)",
+          "expected_mode": "Guardian expected mode",
+          "check_interval_min": "Guardian check interval (minutes)",
+          "override_return_min": "Manual override return time (minutes)",
+          "alert_after_failures": "Alert after this many failed corrections"
         },
         "data_description": {
           "lamp_profile": "Override auto-detection when the wrong model or channel count is shown. Plant and Marine/Reef use their distinct five-channel spectral layouts.",
+          "hold_connection": "Keep Home Assistant's BLE connection to the fixture open and reconnect automatically. Turn off to release the connection for the Fluval app or another controller - same effect as the Bluetooth connection switch.",
           "ping_interval": "How often Home Assistant reads from the light to keep the BLE connection alive. Lower values improve reliability at the cost of slightly more radio traffic. Default: 10 s.",
-          "active_time": "How long to maintain the BLE connection after the last command. Use 0 for a persistent connection with the lowest command latency, or 30–600 seconds to disconnect when idle. Persistent connections consume a Bluetooth connection slot and can prevent the Fluval app or gateway from connecting. Default: 120 s."
+          "active_time": "How long to maintain the BLE connection after the last command. Use 0 for a persistent connection with the lowest command latency, or 30–600 seconds to disconnect when idle. Persistent connections consume a Bluetooth connection slot and can prevent the Fluval app or gateway from connecting. Default: 120 s.",
+          "expected_mode": "The mode the guardian keeps the fixture in. Auto/Professional enforce the matching onboard schedule and clock; Manual keeps the fixture in Manual mode; Unsupervised reports status only and never writes to the fixture. Default: Auto.",
+          "check_interval_min": "How often the guardian checks the fixture's mode, clock, and schedule, in addition to checking right after every reconnect. Default: 10.",
+          "override_return_min": "How long a manual channel, effect, or light change from Home Assistant is allowed to hold Manual mode before the guardian restores the expected schedule mode. Use 0 to never auto-return - end the override with the Return to schedule button or action instead. Default: 60.",
+          "alert_after_failures": "Consecutive failed corrections before the schedule-problem sensor and a repair notification turn on. Default: 3."
         }
       }
     }
@@ -55,10 +65,19 @@
       "message": "Unable to control the Fluval light: {error}"
     }
   },
+  "issues": {
+    "schedule_problem": {
+      "title": "{name} is not following its expected schedule",
+      "description": "The Fluval BLE guardian could not keep {name} on its expected mode or schedule after repeated attempts, or the fixture has been unreachable for a while. Check that the light is powered, in Bluetooth range of a working adapter or ESPHome proxy, and not held open by the Fluval app. The guardian keeps retrying and this notification clears automatically once a check succeeds."
+    }
+  },
   "entity": {
     "binary_sensor": {
       "connection": {
         "name": "Reachable"
+      },
+      "schedule_problem": {
+        "name": "Schedule problem"
       }
     },
     "button": {
@@ -67,6 +86,9 @@
       },
       "sync_clock": {
         "name": "Sync clock"
+      },
+      "return_to_schedule": {
+        "name": "Return to schedule"
       }
     },
     "select": {
@@ -82,6 +104,9 @@
     "switch": {
       "daylight_saving_time": {
         "name": "Daylight saving time"
+      },
+      "bluetooth_connection": {
+        "name": "Bluetooth connection"
       }
     },
     "light": {
@@ -98,6 +123,22 @@
       },
       "active_connection_source": {
         "name": "Source"
+      },
+      "guardian_status": {
+        "name": "Guardian status",
+        "state": {
+          "ok": "OK",
+          "corrected": "Corrected",
+          "failed": "Failed",
+          "unreachable": "Unreachable",
+          "paused": "Paused"
+        }
+      },
+      "guardian_last_check": {
+        "name": "Guardian last check"
+      },
+      "guardian_corrections": {
+        "name": "Guardian corrections"
       }
     }
   }

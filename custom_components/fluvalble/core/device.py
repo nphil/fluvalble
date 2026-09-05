@@ -3,10 +3,12 @@
 from collections.abc import AsyncIterator, Awaitable, Callable
 import asyncio
 import contextlib
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import wraps
 import logging
 from time import monotonic
+import time
 from typing import Any, Concatenate, ParamSpec, TypeVar, TypedDict, cast
 
 from bleak import AdvertisementData, BLEDevice, BleakError, BleakScanner
@@ -15,7 +17,9 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.event import async_track_point_in_time
 
 from . import (
+    CONF_HOLD_CONNECTION,
     CONF_LAMP_PROFILE,
+    DEFAULT_HOLD_CONNECTION,
     DEFAULT_LAMP_PROFILE,
     LAMP_PROFILE_AQUASKY,
     LAMP_PROFILE_AQUASKY3,
@@ -130,6 +134,20 @@ class Attribute(TypedDict, total=False):
     native_unit_of_measurement: str | None
 
 
+@dataclass(frozen=True)
+class FluvalState:
+    """A confirmed on-device snapshot returned by `Device.async_read_state`."""
+
+    mode: str
+    power: bool | None
+    levels: dict[str, int] | None
+    auto_schedule: dict[str, Any] | None
+    pro_schedule: list[dict[str, Any]] | None
+    last_state_at: float | None
+    connection_attempts: int
+    scanner_source: str | None
+
+
 class Device:
     """Fluval BLE LED device class."""
 
@@ -221,6 +239,10 @@ class Device:
         self._commanded_at: float | None = None
         self._effect_restore_channels: dict[str, int] | None = None
         self._reachability_unsub: Callable[[], None] | None = None
+        self._hold_connection: bool = bool(config_data.get(CONF_HOLD_CONNECTION, DEFAULT_HOLD_CONNECTION))
+        self._connection_listeners: list[Callable[[bool], None]] = []
+        self._last_state_at: float | None = None
+        self.mode_changed_by_write: bool = False
 
         if device and advertisement:
             self.update_ble(device, advertisement, advertisement_source)
@@ -239,6 +261,59 @@ class Device:
     def controls_available(self) -> bool:
         """Return true when HA has enough BLE info to attempt commands."""
         return bool(self.client or self.conn_info.get("last_seen"))
+
+    @property
+    def hold_connection(self) -> bool:
+        """Return whether Home Assistant should hold the BLE connection open.
+
+        True keeps the GATT link up and reconnects on advertisement/backoff,
+        which is what lets the Guardian supervise the fixture continuously.
+        False disconnects immediately and refuses every new BLE connection
+        (including for commands) until set back to True, freeing the single
+        GATT slot for the FluvalConnect app.
+        """
+        return self._hold_connection
+
+    @hold_connection.setter
+    def hold_connection(self, value: bool) -> None:
+        """Resume (True) or park (False) the BLE connection supervisor."""
+        value = bool(value)
+        changed = value != self._hold_connection
+        self._hold_connection = value
+        if self.client is not None:
+            self.client.hold_connection = value
+        if changed:
+            for handler in self.updates_connect:
+                handler()
+
+    def _connection_parked(self) -> bool:
+        """Return whether HA must not initiate a new BLE connection right now."""
+        return not self._hold_connection and not self.connected
+
+    def register_connection_listener(self, listener: Callable[[bool], None]) -> Callable[[], None]:
+        """Subscribe to GATT connect/disconnect transitions.
+
+        `listener` is called with the new `connected` state on every
+        transition (not immediately at registration time). Returns an
+        idempotent unsubscribe callable.
+        """
+        self._connection_listeners.append(listener)
+
+        def _unsubscribe() -> None:
+            with contextlib.suppress(ValueError):
+                self._connection_listeners.remove(listener)
+
+        return _unsubscribe
+
+    @property
+    def connection_attempts(self) -> int:
+        """Return how many BLE connection attempts the current client has made."""
+        return getattr(self.client, "connection_attempts", 0) if self.client is not None else 0
+
+    @property
+    def scanner_source(self) -> str | None:
+        """Return the HA scanner source address serving the active connection."""
+        return self.conn_info.get("active_connection_source_address")
 
     @contextlib.asynccontextmanager
     async def command_transaction(self, *, supersede_transition: bool = True) -> AsyncIterator[None]:
@@ -348,7 +423,8 @@ class Device:
         )
 
         if self.client is None:
-            self.client = self._new_client(device)
+            if self._hold_connection:
+                self.client = self._new_client(device)
         else:
             self.client.device = device
 
@@ -455,6 +531,8 @@ class Device:
             handler()
         for handler in self.updates_component:
             handler()
+        for listener in list(self._connection_listeners):
+            listener(connected)
 
     def is_reachable(self) -> bool:
         """Return whether the fixture has a live session or recent activity."""
@@ -883,15 +961,14 @@ class Device:
             if any(static_channels.values()):
                 self._effect_restore_channels = static_channels
 
-        packets: list[bytes] = []
         if self.values.get("mode") != "manual":
-            packets.append(
-                protocol.spp_mode_packet(MODE_TO_CODE["manual"])
-                if plant_pro
-                else protocol.wifi_mode_packet(MODE_TO_CODE["manual"])
-                if facebd
-                else protocol.old_mode_packet(MODE_TO_CODE["manual"])
-            )
+            if await self.async_ensure_mode("manual") != "manual":
+                self.values = old_values
+                self._effect_restore_channels = old_restore
+                return False
+            self.mode_changed_by_write = True
+
+        packets: list[bytes] = []
         if not self.values.get("led_on_off"):
             packets.append(
                 protocol.spp_switch_packet(True)
@@ -1178,6 +1255,8 @@ class Device:
             extra = dict(self.conn_info)
             extra["gatt_connected"] = self.connected
             return Attribute(is_on=self.is_reachable(), extra=extra)
+        if attr == "bluetooth_connection":
+            return Attribute(is_on=self.hold_connection)
         if attr.startswith("channel_"):
             return Attribute(min=0, max=100, step=1, value=self.values[attr])
         if attr == "mode":
@@ -1210,7 +1289,7 @@ class Device:
 
     def register_update(self, attr: str, handler: Callable):
         """Register handlers for updates."""
-        if attr in ("connection", "rssi", "last_seen", "active_connection_source"):
+        if attr in ("connection", "rssi", "last_seen", "active_connection_source", "bluetooth_connection"):
             self.updates_connect.append(handler)
         else:
             self.updates_component.append(handler)
@@ -1219,7 +1298,7 @@ class Device:
         """Remove a previously registered update handler."""
         target = (
             self.updates_connect
-            if attr in ("connection", "rssi", "last_seen", "active_connection_source")
+            if attr in ("connection", "rssi", "last_seen", "active_connection_source", "bluetooth_connection")
             else self.updates_component
         )
         with contextlib.suppress(ValueError):
@@ -1300,16 +1379,10 @@ class Device:
             return False
 
         if self.values.get("mode") != "manual":
-            if self._uses_wifi_protocol():
-                ok = await self._async_send_packet(protocol.wifi_mode_packet(MODE_TO_CODE["manual"]))
-            elif self._uses_plant_pro_protocol():
-                ok = await self._async_send_packet(protocol.spp_mode_packet(MODE_TO_CODE["manual"]))
-            else:
-                ok = await self._async_send_packet(protocol.old_mode_packet(MODE_TO_CODE["manual"]))
-            if not ok:
+            if await self.async_ensure_mode("manual") != "manual":
                 self.values = old_values
                 return False
-            self.values["mode"] = "manual"
+            self.mode_changed_by_write = True
 
         for channel, value in targets.items():
             self.values[channel] = value
@@ -1742,6 +1815,12 @@ class Device:
             self.values = old_values
             return False
 
+        if self.values.get("mode") != "manual":
+            if await self.async_ensure_mode("manual") != "manual":
+                self.values = old_values
+                return False
+            self.mode_changed_by_write = True
+
         if self._uses_wifi_protocol():
             ok = await self._async_send_packet(protocol.wifi_switch_packet(value))
         elif self._uses_plant_pro_protocol():
@@ -1926,7 +2005,31 @@ class Device:
             self.values = old_values
             for handler in self.updates_component:
                 handler()
+        else:
+            self.mode_changed_by_write = False
         return ok
+
+    @serialized_device_command
+    async def async_ensure_mode(self, mode: str) -> str | None:
+        """Ensure the fixture confirms `mode`, writing only when it must change.
+
+        Returns the freshly confirmed mode string (which may differ from
+        `mode` if the fixture did not take the write) or None if the write
+        or its confirmation could not be completed at all (unreachable, or
+        the connection is currently parked via `hold_connection = False`).
+        Raises ValueError for a `mode` outside MODES - that is a programming
+        error, not a runtime BLE failure.
+        """
+        if mode not in MODES:
+            raise ValueError(f"Unknown Fluval mode: {mode!r}")
+        if self.values.get("mode") == mode:
+            return mode
+        if not await self._async_prepare_command():
+            return None
+        if await self._async_send_packet(self._native_mode_packet(mode)):
+            self.mode_changed_by_write = False
+        confirmed = self.values.get("mode")
+        return confirmed if isinstance(confirmed, str) else None
 
     async def _async_on_client_ready(self) -> None:
         """Send the APK's clock command before the initial parameter read."""
@@ -1954,6 +2057,13 @@ class Device:
         async with self._clock_sync_lock:
             if self._clock_synced and not force:
                 return True
+
+            if self._connection_parked():
+                self._set_diagnostic_error(
+                    "connection_held",
+                    "Bluetooth connection is held for the companion app; enable hold connection to sync the clock",
+                )
+                return False
 
             if self.client is None:
                 if not await self._async_ensure_client():
@@ -2043,6 +2153,12 @@ class Device:
 
     async def _async_prepare_command(self) -> bool:
         """Resolve the BLE device and connect far enough to know the protocol."""
+        if self._connection_parked():
+            self._set_diagnostic_error(
+                "connection_held",
+                "Bluetooth connection is held for the companion app; enable hold connection to send commands",
+            )
+            return False
         if not await self._async_ensure_client() or self.client is None:
             self._set_diagnostic_error("device_not_found", "BLE device is not available")
             return False
@@ -2070,6 +2186,7 @@ class Device:
             packet.hex(),
         )
         expected_state = self._expected_state_for_packet(packet)
+        classic_target = self._classic_confirmation_target(packet) if verify else None
         if not await client.send_now(packet, expected_state=expected_state, verify=verify):
             self._set_diagnostic_error(
                 "write_failed",
@@ -2077,17 +2194,33 @@ class Device:
             )
             return False
 
+        write_verified = client.last_write_verified
+        if classic_target is not None:
+            write_verified = await self._async_confirm_classic_state(classic_target)
+            if not write_verified:
+                self._set_diagnostic_error(
+                    "write_unconfirmed",
+                    f"Fluval did not confirm {', '.join(classic_target)} after the write",
+                )
+                return False
+
         self.diagnostics.update(
             {
-                "status": ("last_write_verified" if client.last_write_verified else "last_write_unverified"),
+                "status": ("last_write_verified" if write_verified else "last_write_unverified"),
                 "last_write_at": datetime.now(UTC).isoformat(),
                 "last_write_packet": packet.hex(),
                 "last_write_targets": list(client.last_write_targets),
-                "last_write_verified": client.last_write_verified,
+                "last_write_verified": write_verified,
                 "connection_profile": client.profile,
                 "command_write_uuid": client.command_write_uuid,
-                "last_expected_state": dict(client.last_expected_state),
-                "last_confirmed_state": dict(client.last_confirmed_state),
+                "last_expected_state": (
+                    dict(classic_target) if classic_target is not None else dict(client.last_expected_state)
+                ),
+                "last_confirmed_state": (
+                    {key: self.values.get(key) for key in classic_target}
+                    if classic_target is not None
+                    else dict(client.last_confirmed_state)
+                ),
                 "last_verification_mismatches": dict(client.last_verification_mismatches),
                 "last_error": None,
             }
@@ -2099,6 +2232,43 @@ class Device:
         for handler in self.updates_connect:
             handler()
         return True
+
+    def _classic_confirmation_target(self, packet: bytes) -> dict[str, Any] | None:
+        """Return the field(s) a classic write must confirm, or None if unconfirmable.
+
+        Only the classic (legacy-encrypted) transport reaches this path -
+        FACEBD/SPP writes are already confirmed through
+        `_expected_state_for_packet` and the CBOR-keyed verification in
+        `Client.send_now`.
+        """
+        if self.client is None or self.client.raw_facebd or len(packet) < 3 or packet[0] != 0x68:
+            return None
+        opcode = packet[1]
+        if opcode == protocol.OLD_MODE and packet[2] < len(MODES):
+            return {"mode": MODES[packet[2]]}
+        if opcode == protocol.OLD_SWITCH:
+            return {"led_on_off": bool(packet[2])}
+        if opcode == protocol.OLD_ALL_ZONE:
+            return {channel: int(self.values.get(channel, 0)) for channel in self.numbers()}
+        return None
+
+    async def _async_confirm_classic_state(self, expected: dict[str, Any]) -> bool:
+        """Re-read classic state and confirm it reflects `expected` after a write."""
+        client = self.client
+        if client is None:
+            return False
+        try:
+            await client.request_state()
+        except (TimeoutError, BleakError) as err:
+            _LOGGER.debug("Unable to read Fluval state to confirm a command", exc_info=err)
+            return False
+        if "mode" in expected:
+            return self.values.get("mode") == expected["mode"]
+        if self.values.get("mode") != "manual":
+            # Auto/Pro bodies never carry power or channel levels, so a mode
+            # that moved away from manual cannot confirm either one here.
+            return False
+        return all(self.values.get(key) == value for key, value in expected.items())
 
     def _expected_state_for_packet(self, packet: bytes) -> dict[int, Any] | None:
         """Return exact supported FACEBD values expected after a command."""
@@ -2151,6 +2321,42 @@ class Device:
 
         return True
 
+    @serialized_device_command
+    async def async_read_state(self) -> FluvalState | None:
+        """Read and return a confirmed snapshot of the fixture's on-device state.
+
+        Talks to `self.client` directly (not `_async_ensure_client`/
+        `async_refresh_state`) so this also works the moment a client object
+        exists, reusing Client's own device_provider-based route refresh.
+        """
+        if self._connection_parked() or self.client is None:
+            return None
+        try:
+            await self.client.request_state()
+        except (TimeoutError, BleakError) as err:
+            _LOGGER.debug("Unable to read Fluval state", exc_info=err)
+            return None
+        self._last_state_at = time.time()
+        mode = self.values.get("mode")
+        if not isinstance(mode, str):
+            return None
+        if mode == "manual":
+            power: bool | None = bool(self.values.get("led_on_off"))
+            levels: dict[str, int] | None = {channel: int(self.values.get(channel, 0)) for channel in self.numbers()}
+        else:
+            power = None
+            levels = None
+        return FluvalState(
+            mode=mode,
+            power=power,
+            levels=levels,
+            auto_schedule=self.values.get("native_auto_schedule") if mode == "automatic" else None,
+            pro_schedule=self.values.get("native_pro_schedule") if mode == "professional" else None,
+            last_state_at=self._last_state_at,
+            connection_attempts=self.connection_attempts,
+            scanner_source=self.scanner_source,
+        )
+
     async def async_collect_diagnostics(self) -> dict[str, Any]:
         """Collect a practical snapshot without changing the BLE session."""
         now = datetime.now(UTC)
@@ -2169,6 +2375,7 @@ class Device:
             "connection_options": {
                 "ping_interval": self._ping_interval,
                 "active_time": self._active_time,
+                "hold_connection": self._hold_connection,
             },
             "values": dict(self.values),
             "connection_info": dict(self.conn_info),
@@ -2230,6 +2437,7 @@ class Device:
             self.decode_update_packet,
             ping_interval=self._ping_interval,
             active_time=self._active_time,
+            hold_connection=self._hold_connection,
             device_provider=self._connectable_ble_device,
             connection_ready_callback=self._record_active_connection_source,
             ready_callback=self._async_on_client_ready,
@@ -2239,6 +2447,9 @@ class Device:
     async def _async_ensure_client(self) -> bool:
         """Create or refresh a client using HA's best connectable BLE route."""
         if not self.address:
+            return False
+
+        if self._connection_parked():
             return False
 
         device = await self._async_find_device()

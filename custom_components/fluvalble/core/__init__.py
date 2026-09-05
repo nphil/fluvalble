@@ -7,9 +7,11 @@ CONFIG_ENTRY_VERSION = 2
 CONF_PING_INTERVAL = "ping_interval"
 CONF_ACTIVE_TIME = "active_time"
 CONF_LAMP_PROFILE = "lamp_profile"
+CONF_HOLD_CONNECTION = "hold_connection"
 DEFAULT_PING_INTERVAL = 10  # seconds between keep-alive reads
 DEFAULT_ACTIVE_TIME = 120  # seconds to stay connected after last command
 DEFAULT_LAMP_PROFILE = "auto"
+DEFAULT_HOLD_CONNECTION = True  # keep the BLE link open and self-heal, vs. connect-on-demand
 
 # Lamp profile options (options flow + channel layout)
 LAMP_PROFILE_AUTO = "auto"
@@ -25,6 +27,33 @@ LAMP_PROFILES = (
     LAMP_PROFILE_MARINE,
     LAMP_PROFILE_AQUASKY,
     LAMP_PROFILE_AQUASKY3,
+)
+
+# Guardian options flow keys / defaults
+CONF_EXPECTED_MODE = "expected_mode"
+CONF_CHECK_INTERVAL_MIN = "check_interval_min"
+CONF_OVERRIDE_RETURN_MIN = "override_return_min"
+CONF_ALERT_AFTER_FAILURES = "alert_after_failures"
+DEFAULT_EXPECTED_MODE = "auto"
+DEFAULT_CHECK_INTERVAL_MIN = 10  # minutes between guardian checks
+DEFAULT_OVERRIDE_RETURN_MIN = 60  # minutes before a manual override auto-returns; 0 = never
+DEFAULT_ALERT_AFTER_FAILURES = 3  # consecutive correction failures before the problem sensor turns on
+
+# Guardian-managed key inside ConfigEntry.options. Not part of the options
+# form schema - written by the schedule-programming services/entities so the
+# guardian knows the schedule it should keep enforcing on the fixture.
+CONF_EXPECTED_SCHEDULE = "expected_schedule"
+
+# Guardian expected-mode options (options flow + ScheduleGuardian)
+EXPECTED_MODE_AUTO = "auto"
+EXPECTED_MODE_PRO = "pro"
+EXPECTED_MODE_MANUAL = "manual"
+EXPECTED_MODE_UNSUPERVISED = "unsupervised"
+EXPECTED_MODES = (
+    EXPECTED_MODE_AUTO,
+    EXPECTED_MODE_PRO,
+    EXPECTED_MODE_MANUAL,
+    EXPECTED_MODE_UNSUPERVISED,
 )
 
 # ---------------------------------------------------------------------------

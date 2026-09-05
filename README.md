@@ -175,6 +175,54 @@ readback behavior, and protocol details.
 
 ---
 
+## Schedule Guardian & connection sharing
+
+These fixtures accept exactly **one Bluetooth connection at a time**. If Home
+Assistant holds it, the Fluval app cannot connect - and until this release,
+the reverse was also true for hours at a stretch: a dropped or app-held
+connection could leave the light stuck out of Auto mode with nothing to
+notice or fix it.
+
+Fluval BLE now treats the fixture's own onboard schedule as the safety net
+(it keeps running with zero Home Assistant involvement) and layers an active
+supervisor, the **Schedule Guardian**, on top. Right after every reconnect,
+and again on a configurable interval, the guardian:
+
+1. Re-syncs the fixture's clock, so its onboard schedule fires at the right
+   time even after a power loss or RTC drift.
+2. Reads the fixture's current mode and, if it doesn't match the mode you've
+   configured (Auto, Professional, or Manual), corrects it back.
+3. Compares the fixture's stored Auto/Professional schedule against the one
+   you last programmed through this integration and re-uploads it if the
+   fixture's copy has drifted.
+
+**Manual overrides.** Changing colour, effects, or power from Home Assistant
+while the guardian expects Auto or Professional necessarily switches the
+fixture to Manual mode first - the protocol silently ignores those commands
+otherwise. The guardian treats this as a deliberate, temporary override: it
+leaves the fixture in Manual for `override_return_min` (default 60 minutes,
+or never with `0`) before restoring the expected mode. Press **Return to
+schedule** or call `fluvalble.end_override` to restore it immediately.
+
+**When the guardian can't fix something** - repeated failed corrections or
+the fixture being unreachable for a while - the `binary_sensor` for schedule
+problem turns on and Home Assistant opens a repair notification. Call
+`fluvalble.guardian_check_now` to force an immediate check outside the normal
+interval.
+
+**Sharing the connection deliberately.** The new **Bluetooth connection**
+switch lets you release Home Assistant's hold on the fixture on demand (for
+example, to make a change from the Fluval app) without removing the
+integration. Turning it off disconnects immediately and keeps Home Assistant
+from reconnecting until it's turned back on; the guardian pauses its checks
+while it's off and reports that clearly rather than treating it as a fault.
+
+Configure `expected_mode`, `check_interval_min`, `override_return_min`, and
+`alert_after_failures` from the integration's **Configure** dialog. Set
+`expected_mode` to **Unsupervised** for a fixture you want visibility into
+without any automatic corrections.
+
+
 ## Entities
 
 After setup you'll see one device with entities like:
@@ -182,12 +230,16 @@ After setup you'll see one device with entities like:
 | Entity | Display name | Purpose |
 |--------|-------------|---------|
 | **Light** | Light | Power, brightness, colour, and supported native effects. |
-| **Select** | Mode | Manual / Automatic / Professional. |
+| **Select** | Mode | Manual / Automatic / Professional. Shows `override_active` / `override_until` attributes while the guardian is honouring a manual override. |
 | **Button** | Identify | Runs the fixture's native FluvalConnect Find command so the physical light identifies itself. |
 | **Binary sensor** | Reachable | Fixture seen recently over BLE; raw GATT connection state remains available as an attribute. |
+| **Binary sensor** | Schedule problem | On after repeated failed guardian corrections or extended unreachability; pairs with a repair notification. |
 | **Sensors** | Signal strength / Source / Last seen | Optional Bluetooth diagnostics. Signal strength is disabled by default; Source shows the active route's friendly name. |
+| **Sensors** | Guardian status / last check / corrections | Guardian outcome (`ok`/`corrected`/`failed`/`unreachable`/`paused`), when it last ran, and a running correction count. |
 | **Button** | Sync Clock | Synchronizes the fixture's real-time clock with Home Assistant. |
+| **Button** | Return to schedule | Ends an active manual override immediately instead of waiting for the return timer. |
 | **Switch** | Daylight saving time | Onboard setting available on supported AquaSky 3.0 fixtures. |
+| **Switch** | Bluetooth connection | Always available. Holds or releases Home Assistant's single BLE connection slot on demand - see [Schedule Guardian](#schedule-guardian--connection-sharing). |
 
 Entity IDs follow the pattern `<platform>.fluval_<mac_without_colons>_<name>`, for example `light.fluval_aabbccddeeff_light`. You can find the exact IDs in **Settings → Devices & services → Fluval Aquarium LED → entities**.
 If a light, mode, daylight-saving, Identify, or Sync clock command cannot reach
@@ -304,6 +356,7 @@ its APK sources are documented separately in
 
 - Original integration structure and BLE work by [@mrzottel](https://github.com/mrzottel).
 - Project maintenance and Home Assistant integration development by [@MrMooreUK](https://github.com/MrMooreUK).
+- Schedule Guardian, Bluetooth connection sharing, and this fork's continued maintenance by [@nphil](https://github.com/nphil).
 - AquaSky 3 schedule-card work and ESPHome Bluetooth Proxy improvements by [@atomicalsoftwares](https://github.com/atomicalsoftwares).
 - APK-backed product profiles, native controls, effects, schedules, and diagnostics contributed by [@Wheemer](https://github.com/Wheemer).
 - Plant PRO Bluetooth protocol research and hardware validation by [@cryystyy](https://github.com/cryystyy/fluval-plant-pro-4-homeassistant), used under the MIT License.

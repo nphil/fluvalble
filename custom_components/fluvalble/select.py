@@ -7,13 +7,14 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from . import require_entry_runtime_data
 from .core.device import Device
 from .core.entity import FluvalEntity
+from .core.guardian import ScheduleGuardian
 
 PARALLEL_UPDATES = 0
 
 
-def create_entities(device: Device) -> list:
+def create_entities(device: Device, guardian: ScheduleGuardian | None = None) -> list:
     """Build the entity list for this platform."""
-    return [FluvalSelect(device, s) for s in device.selects()]
+    return [FluvalSelect(device, s, guardian) for s in device.selects()]
 
 
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, add_entities: AddEntitiesCallback):
@@ -21,13 +22,18 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, add_
     device = runtime.device
 
     if device:
-        add_entities(create_entities(device))
+        add_entities(create_entities(device, runtime.guardian))
     else:
         runtime.pending_add_entities[Platform.SELECT] = add_entities
 
 
 class FluvalSelect(FluvalEntity, SelectEntity):
     _attr_icon = "mdi:tune"
+
+    def __init__(self, device: Device, attr: str, guardian: ScheduleGuardian | None = None) -> None:
+        """Initialize a select entity, optionally mirroring guardian override state."""
+        self.guardian = guardian
+        super().__init__(device, attr)
 
     def internal_update(self):
         attribute = self.device.attribute(self.attr)
@@ -39,6 +45,15 @@ class FluvalSelect(FluvalEntity, SelectEntity):
         self._attr_current_option = attribute.get("default")
         self._attr_options = attribute.get("options", [])
         self._attr_available = "default" in attribute and self.device.controls_available
+
+        if self.guardian is not None and self.attr == "mode":
+            # A manual write from Home Assistant while the guardian expects
+            # Auto/Professional shows up here as an active override, with the
+            # timestamp the guardian will restore the expected mode by.
+            self._attr_extra_state_attributes = {
+                "override_active": self.guardian.override_active,
+                "override_until": self.guardian.override_until,
+            }
 
         if self.hass:
             self._async_write_ha_state()

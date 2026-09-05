@@ -1,0 +1,40 @@
+{
+  "entity": {
+    "binary_sensor": {
+      "schedule_problem": {
+        "default": "mdi:calendar-alert"
+      }
+    },
+    "button": {
+      "return_to_schedule": {
+        "default": "mdi:calendar-sync-outline"
+      }
+    },
+    "switch": {
+      "bluetooth_connection": {
+        "default": "mdi:bluetooth-connect",
+        "state": {
+          "off": "mdi:bluetooth-off"
+        }
+      }
+    },
+    "sensor": {
+      "guardian_status": {
+        "default": "mdi:shield-check-outline",
+        "state": {
+          "ok": "mdi:shield-check-outline",
+          "corrected": "mdi:shield-sync-outline",
+          "failed": "mdi:shield-alert-outline",
+          "unreachable": "mdi:shield-off-outline",
+          "paused": "mdi:shield-off-outline"
+        }
+      },
+      "guardian_last_check": {
+        "default": "mdi:clock-check-outline"
+      },
+      "guardian_corrections": {
+        "default": "mdi:wrench-clock-outline"
+      }
+    }
+  }
+}

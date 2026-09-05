@@ -182,6 +182,17 @@ def _stub_homeassistant():
 
     ha_redact.async_redact_data = _async_redact_data
 
+    # ---- homeassistant.helpers.issue_registry ----
+    class IssueSeverity(str, enum.Enum):
+        ERROR = "error"
+        WARNING = "warning"
+        CRITICAL = "critical"
+
+    ha_issue_registry = types.ModuleType("homeassistant.helpers.issue_registry")
+    ha_issue_registry.IssueSeverity = IssueSeverity
+    ha_issue_registry.async_create_issue = MagicMock()
+    ha_issue_registry.async_delete_issue = MagicMock()
+
     # ---- homeassistant.helpers.entity ----
     class _FakeEntity:
         _attr_should_poll = False
@@ -222,6 +233,7 @@ def _stub_homeassistant():
     ha_helpers.entity = ha_entity
     ha_helpers.device_registry = ha_dr
     ha_helpers.redact = ha_redact
+    ha_helpers.issue_registry = ha_issue_registry
 
     # ---- homeassistant.helpers.entity_platform ----
     ha_ep = types.ModuleType("homeassistant.helpers.entity_platform")
@@ -258,9 +270,11 @@ def _stub_homeassistant():
     class SensorDeviceClass(str, enum.Enum):
         SIGNAL_STRENGTH = "signal_strength"
         TIMESTAMP = "timestamp"
+        ENUM = "enum"
 
     class SensorStateClass(str, enum.Enum):
         MEASUREMENT = "measurement"
+        TOTAL_INCREASING = "total_increasing"
 
     class _FakeSensorEntity(_FakeEntity):
         pass
@@ -288,6 +302,7 @@ def _stub_homeassistant():
     # ---- homeassistant.components.binary_sensor ----
     class BinarySensorDeviceClass(str, enum.Enum):
         CONNECTIVITY = "connectivity"
+        PROBLEM = "problem"
 
     class _FakeBinarySensorEntity(_FakeEntity):
         _attr_is_on = None
@@ -353,6 +368,7 @@ def _stub_homeassistant():
     # ---- homeassistant.helpers.event ----
     ha_event = types.ModuleType("homeassistant.helpers.event")
     ha_event.async_track_point_in_time = MagicMock(return_value=MagicMock())
+    ha_event.async_track_time_interval = MagicMock(return_value=MagicMock())
 
     # ---- homeassistant.util.dt ----
     ha_util = types.ModuleType("homeassistant.util")
@@ -381,6 +397,7 @@ def _stub_homeassistant():
         "homeassistant.helpers": ha_helpers,
         "homeassistant.helpers.device_registry": ha_dr,
         "homeassistant.helpers.redact": ha_redact,
+        "homeassistant.helpers.issue_registry": ha_issue_registry,
         "homeassistant.helpers.entity": ha_entity,
         "homeassistant.helpers.entity_platform": ha_ep,
         "homeassistant.helpers.event": ha_event,

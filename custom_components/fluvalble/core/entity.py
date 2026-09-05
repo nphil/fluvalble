@@ -67,3 +67,31 @@ class FluvalEntity(Entity):
     def internal_update(self):
         """Provide a function for internal updates."""
         pass
+
+
+class FluvalGuardianEntity(FluvalEntity):
+    """Base for entities backed by a ScheduleGuardian instead of Device state.
+
+    Guardian outcomes (status, corrections, override state) live on the
+    ScheduleGuardian for one config entry, not in Device.values/attribute().
+    These entities subscribe to the guardian's own listener list instead of
+    Device.register_update/deregister_update.
+    """
+
+    def __init__(self, device: Device, attr: str, guardian) -> None:
+        """Initialize a guardian-backed entity and subscribe immediately.
+
+        Unlike Device.register_update (deferred to async_added_to_hass), the
+        guardian listener is a plain in-process callback list with no HA
+        registry side effects, so subscribing here means callers who never
+        run the full add-to-hass lifecycle (unit tests, or a guardian check
+        that completes before the entity platform finishes loading) still
+        see live updates.
+        """
+        self.guardian = guardian
+        super().__init__(device, attr)
+        self.async_on_remove(self.guardian.add_listener(self._update_handler))
+
+    async def async_added_to_hass(self) -> None:
+        """Run Entity's own setup without Device.register_update wiring."""
+        await Entity.async_added_to_hass(self)

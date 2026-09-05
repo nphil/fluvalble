@@ -5,7 +5,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
-## [Unreleased]
+## [1.0.0] - 2026-09-05
+
+### Added
+
+- Added a Schedule Guardian that re-syncs the fixture clock, corrects mode
+  drift, and re-pushes the expected Auto/Professional schedule after every
+  reconnect and on a configurable interval, with a manual-override grace
+  window for deliberate Home Assistant writes, a Return to schedule button,
+  and `fluvalble.guardian_check_now` / `fluvalble.end_override` actions.
+- Added guardian status, last-check, and corrections sensors, and a
+  schedule-problem binary sensor backed by a Home Assistant repair
+  notification.
+- Added an always-available Bluetooth connection switch to hold or release
+  the fixture's single BLE connection slot on demand.
+- Added guardian options (expected mode, check interval, override return
+  time, alert threshold) to the integration's Configure dialog.
 
 ### Fixed
 

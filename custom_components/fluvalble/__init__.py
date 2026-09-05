@@ -21,19 +21,24 @@ from homeassistant.const import ATTR_DEVICE_ID, CONF_MAC, EVENT_HOMEASSISTANT_ST
 from homeassistant.core import CoreState, HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH, format_mac
 from homeassistant.helpers.storage import Store
 from .core import (
     CONFIG_ENTRY_VERSION,
     CONF_ACTIVE_TIME,
+    CONF_EXPECTED_SCHEDULE,
+    CONF_HOLD_CONNECTION,
     CONF_PING_INTERVAL,
     DEFAULT_ACTIVE_TIME,
+    DEFAULT_HOLD_CONNECTION,
     DEFAULT_PING_INTERVAL,
     DOMAIN,
 )
 from .core.device import Device
 from .core.discovery import CONF_MODEL, CONF_PRODUCT_ID
 from .core.effects import EFFECT_NONE, WEATHER_EFFECTS, effect_name
+from .core.guardian import ScheduleGuardian, async_setup_guardian, issue_id_for_mac
 
 try:
     from homeassistant.config_entries import ConfigEntryState
@@ -58,6 +63,7 @@ class FluvalRuntimeData:
     """Runtime state for one Fluval config entry."""
 
     device: Device | None = None
+    guardian: ScheduleGuardian | None = None
     pending_add_entities: dict[Platform, Any] = field(default_factory=dict)
     background_tasks: set[asyncio.Task] = field(default_factory=set, repr=False)
 
@@ -146,6 +152,21 @@ def _sync_product_identity(hass: HomeAssistant, entry: FluvalConfigEntry, device
         registry.async_update_device(registry_device.id, model=device.model_name)
 
 
+def _call_entity_factory(factory: Any, device: Device, guardian: ScheduleGuardian | None) -> list:
+    """Call a platform's create_entities(), passing guardian only if it accepts one.
+
+    Every platform touched by the guardian slice takes an optional trailing
+    ``guardian`` parameter; light.py does not, so this keeps the single
+    retroactive-setup loop in _create_device working for both shapes without
+    editing light.py's factory signature.
+    """
+    try:
+        accepts_guardian = "guardian" in inspect.signature(factory).parameters
+    except (TypeError, ValueError):
+        accepts_guardian = False
+    return factory(device, guardian) if accepts_guardian else factory(device)
+
+
 DISCOVERY_LOG_INTERVAL = 5
 SERVICE_SET_CHANNELS = "set_channels"
 SERVICE_PREVIEW_SCHEDULE = "preview_schedule"
@@ -157,6 +178,8 @@ SERVICE_SET_NATIVE_PRO_SCHEDULE = "set_native_pro_schedule"
 SERVICE_SET_NATIVE_EFFECT_SCHEDULE = "set_native_effect_schedule"
 SERVICE_RECALL_MANUAL_PRESET = "recall_manual_preset"
 SERVICE_SAVE_MANUAL_PRESET = "save_manual_preset"
+SERVICE_GUARDIAN_CHECK_NOW = "guardian_check_now"
+SERVICE_END_OVERRIDE = "end_override"
 SERVICES_REGISTERED = "services_registered"
 STATIC_REGISTERED = "static_registered"
 WEBSOCKET_REGISTERED = "websocket_registered"
@@ -406,6 +429,8 @@ NATIVE_PREVIEW_SERVICE_SCHEMA = vol.Schema(
 )
 
 STOP_PREVIEW_SERVICE_SCHEMA = vol.Schema(SERVICE_TARGET_FIELDS)
+GUARDIAN_CHECK_NOW_SERVICE_SCHEMA = vol.Schema(SERVICE_TARGET_FIELDS)
+END_OVERRIDE_SERVICE_SCHEMA = vol.Schema(SERVICE_TARGET_FIELDS)
 
 SCHEDULE_SERVICE_SCHEMA = vol.Schema(
     {
@@ -525,6 +550,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: FluvalConfigEntry) -> bo
             lambda: _sync_firmware_version_to_device_registry(hass, device),
         )
         _sync_product_identity(hass, entry, device)
+        runtime.guardian = async_setup_guardian(hass, entry, device)
 
         # Retroactively add entities for platforms that set up before the
         # device was available (they stashed their add_entities callback).
@@ -547,7 +573,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: FluvalConfigEntry) -> bo
         for platform, add_fn in runtime.pending_add_entities.items():
             factory = factories.get(platform)
             if factory:
-                add_fn(factory(device))
+                add_fn(_call_entity_factory(factory, device, runtime.guardian))
         runtime.pending_add_entities.clear()
 
         _LOGGER.info("Device %s ready", mac)
@@ -602,6 +628,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: FluvalConfigEntry) -> bo
             update_ble,
             {"address": mac},
             bluetooth.BluetoothScanningMode.ACTIVE,
+        )
+    )
+
+    @callback
+    def _on_advertisement_seen(
+        service_info: bluetooth.BluetoothServiceInfoBleak,
+        change: bluetooth.BluetoothChange,
+    ) -> None:
+        """Wake a backed-off reconnect wait the moment the fixture is heard again."""
+        del change
+        if (device := runtime.device) is not None and device.client is not None:
+            device.client.notify_advertisement_seen()
+
+    entry.async_on_unload(
+        bluetooth.async_register_callback(
+            hass,
+            _on_advertisement_seen,
+            {"address": mac},
+            bluetooth.BluetoothScanningMode.PASSIVE,
         )
     )
 
@@ -907,6 +952,7 @@ def _register_services(hass: HomeAssistant) -> None:
         device = get_device(call)
         if not await device.async_set_native_auto_schedule(call.data["schedule"]):
             raise HomeAssistantError(device.diagnostics.get("last_error") or "Unable to store the native Auto schedule")
+        await _async_capture_expected_schedule(hass, device, "automatic")
 
     async def async_set_native_pro_schedule(call: ServiceCall) -> None:
         device = get_device(call)
@@ -914,6 +960,7 @@ def _register_services(hass: HomeAssistant) -> None:
             raise HomeAssistantError(
                 device.diagnostics.get("last_error") or "Unable to store the native Professional schedule"
             )
+        await _async_capture_expected_schedule(hass, device, "professional")
 
     async def async_set_native_effect_schedule(call: ServiceCall) -> None:
         device = get_device(call)
@@ -936,6 +983,21 @@ def _register_services(hass: HomeAssistant) -> None:
         device = get_device(call)
         if not await device.async_save_manual_preset(call.data["slot"]):
             raise HomeAssistantError(device.command_error_message())
+
+    async def async_guardian_check_now(call: ServiceCall) -> None:
+        entry_id = get_entry_id(call.data)
+        guardian = _guardian_for_entry(hass, entry_id)
+        if guardian is None:
+            raise HomeAssistantError("The selected Fluval light does not have a guardian running")
+        await guardian.async_check()
+
+    async def async_end_override(call: ServiceCall) -> None:
+        entry_id = get_entry_id(call.data)
+        guardian = _guardian_for_entry(hass, entry_id)
+        if guardian is None:
+            raise HomeAssistantError("The selected Fluval light does not have a guardian running")
+        if await guardian.async_end_override() == "failed":
+            raise HomeAssistantError("Unable to restore the expected mode")
 
     hass.services.async_register(
         DOMAIN,
@@ -996,6 +1058,18 @@ def _register_services(hass: HomeAssistant) -> None:
         SERVICE_SAVE_MANUAL_PRESET,
         async_save_manual_preset,
         schema=MANUAL_PRESET_SERVICE_SCHEMA,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_GUARDIAN_CHECK_NOW,
+        async_guardian_check_now,
+        schema=GUARDIAN_CHECK_NOW_SERVICE_SCHEMA,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_END_OVERRIDE,
+        async_end_override,
+        schema=END_OVERRIDE_SERVICE_SCHEMA,
     )
     hass.data[DOMAIN][SERVICES_REGISTERED] = True
 
@@ -1360,6 +1434,44 @@ def _device_for_entry(hass: HomeAssistant, entry_id: str) -> Device | None:
     return _runtime_device(hass.data.get(DOMAIN, {}).get(entry_id))
 
 
+def _guardian_for_entry(hass: HomeAssistant, entry_id: str) -> ScheduleGuardian | None:
+    """Return the currently running guardian for a config entry, if any."""
+    runtime = hass.data.get(DOMAIN, {}).get(entry_id)
+    return runtime.guardian if isinstance(runtime, FluvalRuntimeData) else None
+
+
+async def _async_capture_expected_schedule(hass: HomeAssistant, device: Device, target_mode: str) -> None:
+    """Persist the schedule just programmed so the guardian keeps enforcing it.
+
+    Reads back through Device.async_read_state() (when the guardian's Device
+    contract is available) instead of persisting the service's validated
+    input directly - the two are not the same shape, and only the readback
+    shape is guaranteed to compare equal to what future guardian checks
+    read back. entry_id comes from Device.entry_id, set once in
+    _create_device, so this needs no separate device-to-entry lookup table.
+    """
+    read_state = getattr(device, "async_read_state", None)
+    entry_id = getattr(device, "entry_id", None)
+    config_entries = getattr(hass, "config_entries", None)
+    if read_state is None or not entry_id or config_entries is None:
+        return
+    entry = config_entries.async_get_entry(entry_id)
+    if entry is None:
+        return
+
+    state = await read_state()
+    if not state:
+        return
+    schedule = getattr(state, "auto_schedule" if target_mode == "automatic" else "pro_schedule", None)
+    if schedule is None:
+        return
+
+    hass.config_entries.async_update_entry(entry, options={**entry.options, CONF_EXPECTED_SCHEDULE: schedule})
+    runtime = entry_runtime_data(hass, entry)
+    if runtime is not None and runtime.guardian is not None:
+        runtime.guardian.set_expected_schedule(schedule)
+
+
 async def async_set_schedule_mode(hass: HomeAssistant, entry_id: str, mode: str) -> None:
     """Set whether the saved curve is inactive or stored in the fixture."""
     if mode not in {"manual", "native"}:
@@ -1398,6 +1510,8 @@ async def _async_upload_native_schedule(hass: HomeAssistant, entry_id: str, poin
         return False
     ok = await device.async_set_native_pro_schedule(points, activate=True)
     device.diagnostics["native_schedule_last_result"] = "uploaded" if ok else "failed"
+    if ok:
+        await _async_capture_expected_schedule(hass, device, "professional")
     return ok
 
 
@@ -1493,3 +1607,20 @@ async def async_unload_entry(hass: HomeAssistant, entry: FluvalConfigEntry) -> b
 
     hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
     return True
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: FluvalConfigEntry) -> None:
+    """Clean up integration-owned state that outlives a normal unload.
+
+    Runs only when the user removes the config entry entirely - unlike
+    async_unload_entry, which also runs on every routine reload (including
+    one triggered by an options change). Deleting the guardian's
+    schedule-problem repair there would silently clear a still-valid
+    "problem" alert on reload, before the freshly built guardian has run
+    enough checks to know the fixture is still broken. Permanent removal has
+    no such risk, so the repair is dropped for good here instead.
+    """
+    mac = entry.data.get(CONF_MAC)
+    if not mac:
+        return
+    ir.async_delete_issue(hass, DOMAIN, issue_id_for_mac(mac))

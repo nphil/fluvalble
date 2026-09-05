@@ -347,3 +347,27 @@ set_native_effect_schedule:
           enabled: true
       selector:
         object:
+
+guardian_check_now:
+  name: Guardian check now
+  description: Run one ScheduleGuardian check immediately instead of waiting for the next scheduled interval - sync clock, read state, and correct mode or schedule drift right away.
+  fields:
+    device_id:
+      name: Light
+      description: Fluval light whose guardian should check now.
+      required: true
+      selector:
+        device:
+          integration: fluvalble
+
+end_override:
+  name: End manual override
+  description: Immediately return the light to its expected schedule mode, ending an active manual override without waiting for the override return timer.
+  fields:
+    device_id:
+      name: Light
+      description: Fluval light whose manual override should end now.
+      required: true
+      selector:
+        device:
+          integration: fluvalble
