@@ -5,6 +5,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.0.3]
+
+### Fixed
+- Auto and Professional mode now render the light entity's on/off, brightness, and colour from the fixture's own onboard schedule instead of the stale/absent classic BLE readback. Classic status frames never carry live channel levels while a fixture runs Auto or Professional onboard, so a fixture running its schedule at full daytime output was previously shown as off with every channel at zero. The light now derives what the fixture is actually doing right now from the last Auto/Pro schedule readback (the same interpolation the native schedule preview already used), re-rendering once a minute so ramps update without any BLE traffic. A new `level_source` attribute (`reported`, `schedule`, or `unknown`) and, while schedule-derived, a `scheduled_levels` attribute make the source of the displayed state visible.
+- A fixture whose advertisement carries no local name (or whose Bluetooth stack reports its own address as the name) is no longer titled by its raw BLE address. The discovery confirmation screen, the created config entry, and the device-registry name (and the entity_ids derived from it) now default to `Fluval <model>` (e.g. "Fluval Aquasky 900mm"), resolved from the same manufacturer-data product lookup already used elsewhere. A fixture that does advertise a real local name keeps it unchanged. If a second fixture of the same model is configured, its default title is disambiguated with its last two MAC octets.
+
 ## [1.0.2]
 
 ### Fixed

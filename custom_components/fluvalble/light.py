@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
     ATTR_EFFECT,
@@ -12,8 +14,9 @@ from homeassistant.components.light import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_track_time_interval
 
 from . import require_entry_runtime_data
 from .core.device import Device
@@ -23,6 +26,10 @@ from .core.entity import FluvalEntity
 PARALLEL_UPDATES = 0
 
 _DEFAULT_RGB = (255, 255, 255)
+# Auto/Pro levels change with no BLE traffic while a ramp runs. Re-render
+# from the schedule periodically so the light entity does not go stale
+# between fixture status notifications.
+_SCHEDULE_RERENDER_INTERVAL = timedelta(seconds=60)
 
 
 def create_entities(device: Device) -> list:
@@ -64,6 +71,25 @@ class FluvalLight(FluvalEntity, LightEntity):
             self._attr_color_mode = ColorMode.RGB
             self._attr_supported_color_modes = {ColorMode.RGB}
 
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to device updates and start the schedule re-render tick."""
+        await super().async_added_to_hass()
+
+        # Auto/Pro schedule-derived state changes during a ramp with no BLE
+        # traffic at all. ``@callback`` matters: async_track_time_interval
+        # runs a plain function in an executor thread, and touching entity
+        # state from a thread other than the event loop is unsafe. This tick
+        # never talks to the fixture; it only re-renders from values already
+        # in memory.
+        @callback
+        def _rerender_from_schedule(*_args) -> None:
+            if self.device.values.get("mode") in ("automatic", "professional"):
+                self.internal_update()
+
+        self.async_on_remove(
+            async_track_time_interval(self.hass, _rerender_from_schedule, _SCHEDULE_RERENDER_INTERVAL)
+        )
+
     def internal_update(self) -> None:
         """Refresh the entity from decoded fixture state."""
         self._attr_available = self.device.controls_available
@@ -82,13 +108,30 @@ class FluvalLight(FluvalEntity, LightEntity):
                 self._async_write_ha_state()
             return
 
-        self._attr_brightness = self.device.light_brightness_255() or None
+        levels, source = self.device.effective_levels()
+        extra_attributes = {"level_source": source}
+        if source == "schedule" and levels is not None:
+            extra_attributes["scheduled_levels"] = list(levels)
+        self._attr_extra_state_attributes = extra_attributes
+
+        if source != "reported":
+            # Auto/Pro: nothing is "on" over classic BLE, so derive it from
+            # whatever the onboard schedule says the fixture is doing now.
+            self._attr_is_on = bool(levels) and any(level > 0 for level in levels)
+
+        # Only override the reported/commanded channel values when the
+        # schedule actually produced a live reading; "reported" and
+        # "unknown" both fall back to the existing values/commanded-state
+        # path (light_brightness_255() and friends already read self.values
+        # and honour a still-fresh commanded colour when passed no levels).
+        levels_for_display = levels if source == "schedule" else None
+        self._attr_brightness = self.device.light_brightness_255(levels_for_display) or None
 
         mode = self.device.light_mode()
         if mode == "rgb":
             self._attr_color_mode = ColorMode.RGB
             self._attr_supported_color_modes = {ColorMode.RGB}
-            self._attr_rgb_color = self.device.light_rgb_255()
+            self._attr_rgb_color = self.device.light_rgb_255(levels_for_display)
         elif mode == "brightness":
             self._attr_color_mode = ColorMode.BRIGHTNESS
             self._attr_supported_color_modes = {ColorMode.BRIGHTNESS}
@@ -96,7 +139,7 @@ class FluvalLight(FluvalEntity, LightEntity):
         else:
             self._attr_supported_color_modes = {ColorMode.RGB}
             self._attr_color_mode = ColorMode.RGB
-            self._attr_rgb_color = self.device.aquasky_rgb_255()
+            self._attr_rgb_color = self.device.aquasky_rgb_255(levels_for_display)
 
         if self.hass:
             self._async_write_ha_state()

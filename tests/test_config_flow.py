@@ -7,12 +7,14 @@ All HA stubs are registered by conftest.py before this module loads.
 import asyncio
 import os
 import sys
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 import voluptuous as vol
 
 from homeassistant import config_entries
+from homeassistant.const import CONF_MAC
 
 # conftest.py registers all stubs before collection; just ensure path is set.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -20,9 +22,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from custom_components.fluvalble.config_flow import (
     ConfigFlow,
     OptionsFlowHandler,
+    _device_display_name,
     normalize_mac,
     unique_id_from_mac,
     validate_active_time,
+    validate_input,
     MAC_REGEX,
 )
 
@@ -201,14 +205,104 @@ class TestValidateInput:
         assert MAC_REGEX.match(mac)
 
     def test_ble_name_used_as_title(self):
-        """Title should be BLE name when provided, else 'Fluval {mac}'."""
-        mac = "AA:BB:CC:DD:EE:FF"
-        ble_name = "Fluval Plant 3.0"
-        title = ble_name.strip() or f"Fluval {mac}"
-        assert title == "Fluval Plant 3.0"
+        """A real advertised local name always wins as the entry title."""
+        hass = MagicMock()
+        with patch(
+            "custom_components.fluvalble.config_flow.bluetooth.async_last_service_info",
+            return_value=None,
+        ):
+            result = asyncio.run(
+                validate_input(hass, {CONF_MAC: "AA:BB:CC:DD:EE:FF"}, ble_name="Fluval Plant 3.0")
+            )
+        assert result["title"] == "Fluval Plant 3.0"
 
-    def test_fallback_title_when_no_ble_name(self):
-        mac = "AA:BB:CC:DD:EE:FF"
-        ble_name = ""
-        title = ble_name.strip() or f"Fluval {mac}"
-        assert title == "Fluval AA:BB:CC:DD:EE:FF"
+    def test_unnamed_advert_titles_by_resolved_model_not_the_address(self):
+        """No local name must never fall back to the bare BLE address."""
+        hass = MagicMock()
+        hass.config_entries.async_entries.return_value = []
+        advertisement = SimpleNamespace(
+            local_name=None,
+            service_uuids=[],
+            service_data={},
+            manufacturer_data={65535: b"\x00" * 8 + (322).to_bytes(2, "big")},
+        )
+        service_info = SimpleNamespace(name="AA:BB:CC:DD:EE:FF", advertisement=advertisement)
+        with patch(
+            "custom_components.fluvalble.config_flow.bluetooth.async_last_service_info",
+            return_value=service_info,
+        ):
+            result = asyncio.run(validate_input(hass, {CONF_MAC: "AA:BB:CC:DD:EE:FF"}))
+        assert result["title"] == "Fluval Aquasky 900mm"
+        assert result["data"]["model"] == "Aquasky 900mm"
+
+    def test_advert_reporting_its_own_address_as_name_is_treated_as_unnamed(self):
+        """Some BLE stacks default name to the address; that is not a real name."""
+        hass = MagicMock()
+        hass.config_entries.async_entries.return_value = []
+        advertisement = SimpleNamespace(
+            local_name="AA:BB:CC:DD:EE:FF",
+            service_uuids=[],
+            service_data={},
+            manufacturer_data={65535: b"\x00" * 8 + (322).to_bytes(2, "big")},
+        )
+        service_info = SimpleNamespace(name="AA:BB:CC:DD:EE:FF", advertisement=advertisement)
+        with patch(
+            "custom_components.fluvalble.config_flow.bluetooth.async_last_service_info",
+            return_value=service_info,
+        ):
+            result = asyncio.run(validate_input(hass, {CONF_MAC: "AA:BB:CC:DD:EE:FF"}))
+        assert result["title"] == "Fluval Aquasky 900mm"
+
+    def test_second_fixture_with_same_model_gets_octet_disambiguated_title(self):
+        """A duplicate model title still needs to be told apart in the entity list."""
+        hass = MagicMock()
+        hass.config_entries.async_entries.return_value = [SimpleNamespace(data={"model": "Aquasky 900mm"})]
+        advertisement = SimpleNamespace(
+            local_name=None,
+            service_uuids=[],
+            service_data={},
+            manufacturer_data={65535: b"\x00" * 8 + (322).to_bytes(2, "big")},
+        )
+        service_info = SimpleNamespace(name="AA:BB:CC:DD:EE:FF", advertisement=advertisement)
+        with patch(
+            "custom_components.fluvalble.config_flow.bluetooth.async_last_service_info",
+            return_value=service_info,
+        ):
+            result = asyncio.run(validate_input(hass, {CONF_MAC: "AA:BB:CC:DD:EE:FF"}))
+        assert result["title"] == "Fluval Aquasky 900mm (EE:FF)"
+
+
+class TestDeviceDisplayName:
+    """_device_display_name feeds the discovery dropdown and confirm placeholder."""
+
+    def test_named_advert_keeps_its_name(self):
+        service_info = SimpleNamespace(
+            address="AA:BB:CC:DD:EE:FF",
+            advertisement=SimpleNamespace(local_name="Fluval Plant 3.0", manufacturer_data={}),
+        )
+        assert _device_display_name(service_info, is_fluval=True) == "Fluval Plant 3.0 (AA:BB:CC:DD:EE:FF)"
+
+    def test_unnamed_advert_uses_resolved_model(self):
+        service_info = SimpleNamespace(
+            address="AA:BB:CC:DD:EE:FF",
+            advertisement=SimpleNamespace(
+                local_name=None,
+                service_uuids=[],
+                service_data={},
+                manufacturer_data={65535: b"\x00" * 8 + (322).to_bytes(2, "big")},
+            ),
+        )
+        assert _device_display_name(service_info, is_fluval=True) == "Fluval Aquasky 900mm (AA:BB:CC:DD:EE:FF)"
+
+    def test_advert_naming_itself_by_address_uses_resolved_model(self):
+        """Some stacks default the advertised name to the address itself."""
+        service_info = SimpleNamespace(
+            address="AA:BB:CC:DD:EE:FF",
+            advertisement=SimpleNamespace(
+                local_name="AA:BB:CC:DD:EE:FF",
+                service_uuids=[],
+                service_data={},
+                manufacturer_data={65535: b"\x00" * 8 + (322).to_bytes(2, "big")},
+            ),
+        )
+        assert _device_display_name(service_info, is_fluval=True) == "Fluval Aquasky 900mm (AA:BB:CC:DD:EE:FF)"

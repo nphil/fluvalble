@@ -318,6 +318,117 @@ async def _async_test_light_internal_update_and_actions():
     device.async_set_switch.assert_awaited_once_with("led_on_off", False)
 
 
+_REAL_AUTO_SCHEDULE_READBACK = {
+    "sunrise": {"hour": 6, "minute": 0, "ramp": 60},
+    "sunset": {"hour": 18, "minute": 0, "ramp": 60},
+    "sleep": {"hour": 22, "minute": 0},
+    "day_levels": [68, 100, 100, 90],
+    "night_levels": [0, 0, 5, 0],
+}
+
+
+def test_light_renders_scheduled_levels_at_noon_in_automatic_mode():
+    device = _make_device()
+    device.values["mode"] = "automatic"
+    device.values["led_on_off"] = False
+    device.values["channel_1"] = 0
+    device.values["channel_2"] = 0
+    device.values["channel_3"] = 0
+    device.values["channel_4"] = 0
+    device.values["native_auto_schedule"] = dict(_REAL_AUTO_SCHEDULE_READBACK)
+    entity = light.FluvalLight(device, "light")
+
+    with patch("custom_components.fluvalble.core.device.dt_util") as dt_util:
+        dt_util.now.return_value = datetime(2026, 9, 5, 12, 0)
+        entity.internal_update()
+
+    assert entity._attr_is_on is True
+    assert entity._attr_rgb_color != (0, 0, 0)
+    assert entity._attr_extra_state_attributes["level_source"] == "schedule"
+    assert entity._attr_extra_state_attributes["scheduled_levels"] == [68, 100, 100, 90]
+
+
+def test_light_is_off_once_the_schedule_reaches_sleep_time():
+    device = _make_device()
+    device.values["mode"] = "automatic"
+    device.values["led_on_off"] = False
+    device.values["native_auto_schedule"] = dict(_REAL_AUTO_SCHEDULE_READBACK)
+    entity = light.FluvalLight(device, "light")
+
+    with patch("custom_components.fluvalble.core.device.dt_util") as dt_util:
+        dt_util.now.return_value = datetime(2026, 9, 5, 23, 0)
+        entity.internal_update()
+
+    assert entity._attr_is_on is False
+    assert entity._attr_extra_state_attributes["level_source"] == "schedule"
+    assert entity._attr_extra_state_attributes["scheduled_levels"] == [0, 0, 0, 0]
+
+
+def test_light_in_manual_mode_ignores_a_stale_schedule_and_uses_reported_values():
+    device = _make_device()
+    device.values["mode"] = "manual"
+    device.values["led_on_off"] = True
+    device.values["channel_1"] = 12
+    device.values["channel_2"] = 34
+    device.values["channel_3"] = 0
+    device.values["channel_4"] = 0
+    # A schedule readback from a previous Auto session must not leak into
+    # manual-mode rendering.
+    device.values["native_auto_schedule"] = dict(_REAL_AUTO_SCHEDULE_READBACK)
+    entity = light.FluvalLight(device, "light")
+
+    with patch("custom_components.fluvalble.core.device.dt_util") as dt_util:
+        dt_util.now.return_value = datetime(2026, 9, 5, 23, 0)
+        entity.internal_update()
+
+    assert entity._attr_is_on is True
+    assert entity._attr_extra_state_attributes == {"level_source": "reported"}
+
+
+def test_light_level_source_is_unknown_before_the_schedule_is_read_back():
+    device = _make_device()
+    device.values["mode"] = "automatic"
+    device.values["led_on_off"] = False
+    entity = light.FluvalLight(device, "light")
+
+    entity.internal_update()
+
+    assert entity._attr_is_on is False
+    assert entity._attr_extra_state_attributes == {"level_source": "unknown"}
+
+
+def test_light_registers_a_60s_schedule_rerender_tick_marked_for_loop_dispatch():
+    device = _make_device()
+    entity = light.FluvalLight(device, "light")
+
+    captured = {}
+    unsub = MagicMock(name="unsub")
+
+    def fake_track(hass, action, interval):
+        captured["action"] = action
+        captured["interval"] = interval
+        return unsub
+
+    async def run_test():
+        with patch("custom_components.fluvalble.light.async_track_time_interval", fake_track):
+            await entity.async_added_to_hass()
+        assert getattr(captured["action"], "_hass_callback", False) is True
+        assert captured["interval"].total_seconds() == 60
+
+        device.values["mode"] = "automatic"
+        device.values["native_auto_schedule"] = dict(_REAL_AUTO_SCHEDULE_READBACK)
+        with patch("custom_components.fluvalble.core.device.dt_util") as dt_util:
+            dt_util.now.return_value = datetime(2026, 9, 5, 12, 0)
+            captured["action"]()
+        assert entity._attr_extra_state_attributes["level_source"] == "schedule"
+
+        unsub.assert_not_called()
+        await entity.async_will_remove_from_hass()
+        unsub.assert_called_once()
+
+    asyncio.run(run_test())
+
+
 def test_aquasky_mauve_does_not_enable_white_channel():
     asyncio.run(_async_test_aquasky_mauve_does_not_enable_white_channel())
 

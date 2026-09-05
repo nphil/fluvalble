@@ -1877,6 +1877,78 @@ async def _async_test_plant_pro_native_preview_uses_apk_mesh_packet():
     }
 
 
+_REAL_AUTO_SCHEDULE_READBACK = {
+    "sunrise": {"hour": 6, "minute": 0, "ramp": 60},
+    "sunset": {"hour": 18, "minute": 0, "ramp": 60},
+    "sleep": {"hour": 22, "minute": 0},
+    "day_levels": [68, 100, 100, 90],
+    "night_levels": [0, 0, 5, 0],
+}
+
+
+def _auto_device_with_real_readback():
+    device = _make_device(name="AquaSky2.0_Test", model="AquaSky 2.0 Bluetooth LED", product_id=328)
+    device.values["mode"] = "automatic"
+    device.values["led_on_off"] = False
+    device.values["native_auto_schedule"] = dict(_REAL_AUTO_SCHEDULE_READBACK)
+    return device
+
+
+def test_scheduled_levels_now_midway_through_sunrise_ramp_is_half_day_levels():
+    device = _auto_device_with_real_readback()
+    assert device.scheduled_levels_now(now=datetime(2026, 9, 5, 6, 30)) == [34, 50, 50, 45]
+
+
+def test_scheduled_levels_now_at_noon_is_full_day_levels():
+    device = _auto_device_with_real_readback()
+    assert device.scheduled_levels_now(now=datetime(2026, 9, 5, 12, 0)) == [68, 100, 100, 90]
+
+
+def test_scheduled_levels_now_in_the_evening_is_night_levels():
+    device = _auto_device_with_real_readback()
+    assert device.scheduled_levels_now(now=datetime(2026, 9, 5, 20, 0)) == [0, 0, 5, 0]
+
+
+def test_scheduled_levels_now_after_sleep_time_is_off():
+    device = _auto_device_with_real_readback()
+    assert device.scheduled_levels_now(now=datetime(2026, 9, 5, 23, 0)) == [0, 0, 0, 0]
+
+
+def test_scheduled_levels_now_is_none_without_a_schedule_readback():
+    device = _make_device(name="AquaSky2.0_Test", model="AquaSky 2.0 Bluetooth LED", product_id=328)
+    device.values["mode"] = "automatic"
+    assert device.scheduled_levels_now(now=datetime(2026, 9, 5, 12, 0)) is None
+
+
+def test_scheduled_levels_now_is_none_in_manual_mode():
+    device = _auto_device_with_real_readback()
+    device.values["mode"] = "manual"
+    assert device.scheduled_levels_now(now=datetime(2026, 9, 5, 12, 0)) is None
+
+
+def test_effective_levels_uses_schedule_in_automatic_mode():
+    device = _auto_device_with_real_readback()
+    with patch("custom_components.fluvalble.core.device.dt_util") as dt_util:
+        dt_util.now.return_value = datetime(2026, 9, 5, 12, 0)
+        assert device.effective_levels() == ([68, 100, 100, 90], "schedule")
+
+
+def test_effective_levels_is_unknown_in_professional_mode_without_readback():
+    device = _make_device(name="AquaSky2.0_Test", model="AquaSky 2.0 Bluetooth LED", product_id=328)
+    device.values["mode"] = "professional"
+    assert device.effective_levels() == (None, "unknown")
+
+
+def test_effective_levels_in_manual_mode_ignores_any_stale_schedule():
+    device = _auto_device_with_real_readback()
+    device.values["mode"] = "manual"
+    device.values["channel_1"] = 12
+    device.values["channel_2"] = 34
+    device.values["channel_3"] = 0
+    device.values["channel_4"] = 0
+    assert device.effective_levels() == ([12, 34, 0, 0], "reported")
+
+
 def test_classic_auto_preview_uses_fixture_readback_levels():
     asyncio.run(_async_test_classic_auto_preview_uses_fixture_readback_levels())
 
@@ -2344,3 +2416,32 @@ async def _async_test_schedule_preview_does_not_start_when_previous_preview_cann
     device.async_stop_preview.assert_awaited_once_with()
     assert device.preview_task is None
     assert device.preview_restore_values is None
+
+
+def test_device_name_keeps_a_real_advertised_or_entry_name():
+    device = _make_device(name="My Reef Light")
+    assert device.name == "My Reef Light"
+
+
+def test_device_name_falls_back_to_the_model_when_given_only_its_own_address():
+    """A config entry titled by its own MAC (the legacy default) must not
+    keep the device-registry name and derived entity_ids MAC-based."""
+    device = Device(
+        "AA:BB:CC:DD:EE:FF",
+        config_data={
+            "mac": "AA:BB:CC:DD:EE:FF",
+            "model": "Aquasky 900mm",
+        },
+    )
+    assert device.name == "Fluval Aquasky 900mm"
+
+
+def test_device_name_falls_back_to_the_model_when_name_is_blank():
+    device = Device(
+        "",
+        config_data={
+            "mac": "AA:BB:CC:DD:EE:FF",
+            "model": "Fluval Plant PRO LED",
+        },
+    )
+    assert device.name == "Fluval Plant PRO LED"

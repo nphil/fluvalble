@@ -55,7 +55,14 @@ from .core import (
     LAMP_PROFILE_PLANT,
     LAMP_PROFILE_PLANT_PRO,
 )
-from .core.discovery import discovery_metadata, is_likely_fluval
+from .core.discovery import (
+    CONF_MODEL,
+    default_fixture_name,
+    detect_model,
+    discovery_metadata,
+    is_bare_address_name,
+    is_likely_fluval,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -172,18 +179,47 @@ def _device_display_name(
     *,
     is_fluval: bool = False,
 ) -> str:
-    """Build a clear display name so Fluval lights are easy to find in the list."""
+    """Build a clear display name so Fluval lights are easy to find in the list.
+
+    Some Bluetooth stacks report a device's ``name`` as its own address when
+    the advertisement carries no local name. That is not a usable name, so a
+    Fluval fixture falls back to its resolved model instead of the address.
+    """
     if service_info is None:
         return "Unknown device"
     try:
         adv = service_info.advertisement
-        name = ((adv.local_name if adv else None) or getattr(service_info, "name", None) or "").strip()
+        local_name = ((adv.local_name if adv else None) or "").strip()
         address = getattr(service_info, "address", "") or ""
     except Exception:  # noqa: BLE001
         return "Unknown device"
-    if not name or name.lower() == "unknown":
-        name = "Fluval LED" if is_fluval else "Unknown device"
+    if local_name and not is_bare_address_name(local_name, address):
+        name = local_name
+    elif is_fluval:
+        name = default_fixture_name(detect_model(local_name, adv))
+    else:
+        name = "Unknown device"
     return f"{name} ({address})"
+
+
+def _default_title_for_model(hass: HomeAssistant, model: str, mac: str) -> str:
+    """Return the model-based default title, disambiguated if needed.
+
+    A fixture with no usable local name is titled after its resolved model
+    instead of its BLE address. If another configured entry already uses
+    that same model, append this fixture's last two MAC octets so the two
+    remain distinguishable in the entity list.
+    """
+    base = default_fixture_name(model)
+    lowered_model = model.strip().lower()
+    duplicate = any(
+        (entry.data.get(CONF_MODEL) or "").strip().lower() == lowered_model
+        for entry in hass.config_entries.async_entries(DOMAIN)
+    )
+    if not duplicate:
+        return base
+    octets = mac.split(":")[-2:]
+    return f"{base} ({':'.join(octets)})" if len(octets) == 2 else base
 
 
 async def _get_discovered_devices(
@@ -207,20 +243,24 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any], ble_name: st
     mac = normalize_mac(data[CONF_MAC])
     if not MAC_REGEX.match(mac):
         raise InvalidFormat
-    title = ble_name.strip() or f"Fluval {mac}"
-    config_data = {CONF_MAC: mac}
+    config_data: dict[str, Any] = {CONF_MAC: mac}
 
+    local_name = ble_name.strip()
     service_info = bluetooth.async_last_service_info(hass, mac, connectable=True)
     if service_info is None:
         service_info = bluetooth.async_last_service_info(hass, mac)
+    advertisement = service_info.advertisement if service_info is not None else None
+    if not local_name and advertisement is not None:
+        local_name = (advertisement.local_name or "").strip()
+
     if service_info is not None:
-        title = ble_name.strip() or service_info.name or title
-        config_data.update(
-            discovery_metadata(
-                service_info.name or ble_name,
-                service_info.advertisement,
-            )
-        )
+        config_data.update(discovery_metadata(service_info.name or local_name, advertisement))
+
+    if local_name and not is_bare_address_name(local_name, mac):
+        title = local_name
+    else:
+        model = config_data.get(CONF_MODEL) or detect_model(local_name, advertisement)
+        title = _default_title_for_model(hass, model, mac)
 
     return {"title": title, "data": config_data}
 

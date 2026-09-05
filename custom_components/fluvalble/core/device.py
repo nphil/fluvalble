@@ -15,6 +15,7 @@ from bleak import AdvertisementData, BLEDevice, BleakError, BleakScanner
 from homeassistant.components import bluetooth
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.event import async_track_point_in_time
+from homeassistant.util import dt as dt_util
 
 from . import (
     CONF_HOLD_CONNECTION,
@@ -33,7 +34,9 @@ from .color import channel_percentages_to_rgb, rgb_to_channel_percentages
 from .discovery import (
     CONF_MODEL,
     CONF_PRODUCT_ID,
+    default_fixture_name,
     detect_model,
+    is_bare_address_name,
 )
 from .effects import (
     effect_id,
@@ -116,6 +119,29 @@ def serialized_device_command(
 
     return cast(Callable[Concatenate["Device", _P], Awaitable[_R]], wrapped)
 
+def _resolved_device_name(
+    name: str | None,
+    device: BLEDevice | None,
+    address: str,
+    model: str,
+) -> str:
+    """Resolve the device's display name, never falling back to its own address.
+
+    ``name`` is normally the config entry's title, which the config flow
+    already resolves the same way at entry-creation time. This mirrors that
+    rule defensively for any other caller (e.g. a bare :class:`Device`
+    constructed directly) so the device-registry name and derived entity_ids
+    stay model-based rather than MAC-based.
+    """
+    candidate = (name or "").strip()
+    if candidate and not is_bare_address_name(candidate, address):
+        return candidate
+    ble_name = ((device.name if device else None) or "").strip()
+    if ble_name and not is_bare_address_name(ble_name, address):
+        return ble_name
+    return default_fixture_name(model)
+
+
 
 class Attribute(TypedDict, total=False):
     """Attributes used by entities like binary_sensor and number."""
@@ -165,7 +191,7 @@ class Device:
         """Initialize the device."""
         config_data = config_data or {}
         self.hass = hass
-        self.name = name or (device.name if device else None) or "Fluval"
+        self.address = (config_data.get("mac") or (device.address if device else "")).upper()
         configured_product_id = config_data.get(CONF_PRODUCT_ID)
         self.product_id = (
             configured_product_id
@@ -180,9 +206,12 @@ class Device:
             or config_data.get(CONF_MODEL)
             or detect_model((device.name if device else None) or name, advertisement)
         )
+        # Prefer a real advertised/entry name; some Bluetooth stacks default a
+        # nameless fixture's reported name to its own address, which is not a
+        # usable device-registry name any more than it is a usable title.
+        self.name = _resolved_device_name(name, device, self.address, self.model)
         self.lamp_profile = config_data.get(CONF_LAMP_PROFILE, DEFAULT_LAMP_PROFILE)
         self._channel_count_hint: int | None = None
-        self.address = (config_data.get("mac") or (device.address if device else "")).upper()
         self.client: Client | None = None
         self._ping_interval = ping_interval
         self._active_time = active_time
@@ -716,29 +745,27 @@ class Device:
             return "rgb"
         return "rgb_white"
 
-    def master_brightness(self) -> int:
+    def master_brightness(self, levels: list[int] | None = None) -> int:
         """Overall brightness as the brightest supported channel."""
-        chans = self.numbers()
-        return max((self.values.get(ch, 0) for ch in chans), default=0)
+        chans = levels if levels is not None else [self.values.get(ch, 0) for ch in self.numbers()]
+        return max(chans, default=0)
 
-    def light_brightness_255(self) -> int:
+    def light_brightness_255(self, levels: list[int] | None = None) -> int:
         """Return the current light brightness on Home Assistant's 0-255 scale."""
-        if self._commanded_state_matches() and self._commanded_brightness is not None:
+        if levels is None and self._commanded_state_matches() and self._commanded_brightness is not None:
             return self._commanded_brightness
-        return round(self.master_brightness() / 100 * 255)
+        return round(self.master_brightness(levels) / 100 * 255)
 
-    def light_rgb_255(self) -> tuple[int, int, int]:
+    def light_rgb_255(self, levels: list[int] | None = None) -> tuple[int, int, int]:
         """Return a five-channel APK spectrum as an sRGB colour."""
-        if self._commanded_state_matches() and self._commanded_rgb is not None:
+        if levels is None and self._commanded_state_matches() and self._commanded_rgb is not None:
             return self._commanded_rgb
 
         profile = self.spectrum_profile()
         if profile is None:
             return (0, 0, 0)
-        return channel_percentages_to_rgb(
-            profile,
-            tuple(int(self.values.get(channel, 0)) for channel in self.numbers()),
-        )
+        channels = levels if levels is not None else [int(self.values.get(channel, 0)) for channel in self.numbers()]
+        return channel_percentages_to_rgb(profile, tuple(channels))
 
     def aquasky_white_mode(self) -> bool:
         """Return whether an AquaSky is using only its independent white channel."""
@@ -747,14 +774,14 @@ class Device:
             and int(self.values.get("channel_4", 0)) > 0
         )
 
-    def aquasky_rgb_255(self) -> tuple[int, int, int]:
+    def aquasky_rgb_255(self, levels: list[int] | None = None) -> tuple[int, int, int]:
         """Return AquaSky's APK channel state as one Home Assistant RGB colour."""
-        if self._commanded_state_matches() and self._commanded_rgb is not None:
+        if levels is None and self._commanded_state_matches() and self._commanded_rgb is not None:
             return self._commanded_rgb
         profile = self.spectrum_profile()
         if profile is None:
             return (0, 0, 0)
-        percentages = tuple(int(self.values.get(channel, 0)) for channel in AQUASKY_NUMBERS)
+        percentages = tuple(levels) if levels is not None else tuple(int(self.values.get(channel, 0)) for channel in AQUASKY_NUMBERS)
         # FluvalConnect names channel 4 Pure White. Report that native mode as
         # neutral RGB so Home Assistant's single colour picker shows white.
         if percentages[3] > 0 and not any(percentages[:3]):
@@ -763,6 +790,45 @@ class Device:
             profile,
             percentages,
         )
+
+    def scheduled_levels_now(self, now: datetime | None = None) -> list[int] | None:
+        """Return the channel levels the fixture's onboard schedule implies right now.
+
+        Auto/Pro status bodies never carry live channel levels over classic
+        BLE, so ``values`` cannot answer "what is the fixture doing right
+        now" while the fixture is off BLE and coasting on its own clock.
+        This derives that answer from the last schedule readback using the
+        same interpolation the native ``680B`` preview command uses, driven
+        by Home Assistant's local clock (the fixture's own clock is synced
+        to it on every connect).
+        """
+        mode = self.values.get("mode")
+        if mode == "automatic":
+            schedule_type, schedule_key = "auto", "native_auto_schedule"
+        elif mode == "professional":
+            schedule_type, schedule_key = "professional", "native_pro_schedule"
+        else:
+            return None
+        if not self.values.get(schedule_key):
+            return None
+        moment = now if now is not None else dt_util.now()
+        minute = moment.hour * 60 + moment.minute
+        return self._classic_native_preview_levels(schedule_type, minute)
+
+    def effective_levels(self) -> tuple[list[int] | None, str]:
+        """Return the levels actually driving the fixture right now, and their source.
+
+        Manual mode reports live channel_N values over BLE ('reported').
+        Auto/Pro modes do not; what the fixture is doing is derived from its
+        onboard schedule instead ('schedule'), or is 'unknown' until that
+        schedule has been read back at least once.
+        """
+        if self.values.get("mode") in ("automatic", "professional"):
+            scheduled = self.scheduled_levels_now()
+            if scheduled is not None:
+                return scheduled, "schedule"
+            return None, "unknown"
+        return [int(self.values.get(channel, 0)) for channel in self.numbers()], "reported"
 
     def channels_from_aquasky_rgb(
         self,

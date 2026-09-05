@@ -138,6 +138,32 @@ def is_likely_fluval(
     )
 
 
+def _normalized_mac(value: str) -> str:
+    """Normalize a MAC-shaped string for order-insensitive comparison."""
+    return value.strip().upper().replace("-", ":")
+
+
+def is_bare_address_name(name: str | None, address: str | None) -> bool:
+    """Return whether a reported BLE name is actually just the device address.
+
+    Some Bluetooth stacks default a device/service-info ``name`` to the
+    address itself when the advertisement carries no local name at all.
+    That is not a real name and must not be used as one.
+    """
+    if not name or not address:
+        return False
+    return _normalized_mac(name) == _normalized_mac(address)
+
+
+def default_fixture_name(model: str) -> str:
+    """Return the default display name for a fixture with no usable local name.
+
+    Catalogue models are already brand-prefixed for some products (e.g.
+    "Fluval Plant PRO LED"); avoid doubling that prefix for those.
+    """
+    return model if model.lower().startswith("fluval") else f"Fluval {model}"
+
+
 def detect_model(name: str | None, advertisement: AdvertisementData | None) -> str:
     """Return the APK product model, falling back to name/protocol hints."""
     display_name = name or ""
