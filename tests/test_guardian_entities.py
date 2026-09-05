@@ -43,6 +43,10 @@ class _FakeGuardian:
 
     def __init__(self):
         self.status = "ok"
+        # Falls back to `status` like the real ScheduleGuardian.effective_status
+        # does while no check has gone stale; tests that specifically cover
+        # staleness override this directly rather than simulating elapsed time.
+        self._effective_status_override: str | None = None
         self.last_check_at: float | None = None
         self.corrections = 0
         self.problem = False
@@ -51,6 +55,10 @@ class _FakeGuardian:
         self._listeners = []
         self.async_end_override_calls = 0
         self._end_override_result = "corrected"
+
+    @property
+    def effective_status(self) -> str:
+        return self.status if self._effective_status_override is None else self._effective_status_override
 
     def add_listener(self, callback):
         self._listeners.append(callback)
@@ -83,8 +91,19 @@ def test_guardian_status_sensor_reflects_enum_state_and_options():
     entity = sensor.FluvalGuardianStatusSensor(device, "guardian_status", guardian)
 
     assert entity._attr_device_class == SensorDeviceClass.ENUM
-    assert set(entity._attr_options) == {"unknown", "ok", "corrected", "failed", "unreachable", "paused"}
+    assert set(entity._attr_options) == {"unknown", "ok", "corrected", "failed", "unreachable", "paused", "stale"}
     assert entity._attr_native_value == "corrected"
+
+
+def test_guardian_status_sensor_reflects_stale_effective_status_over_status():
+    """A wedged check freezes `status`; the sensor must show `effective_status` instead."""
+    device = _make_device()
+    guardian = _FakeGuardian()
+    guardian.status = "ok"
+    guardian._effective_status_override = "stale"
+    entity = sensor.FluvalGuardianStatusSensor(device, "guardian_status", guardian)
+
+    assert entity._attr_native_value == "stale"
 
 
 def test_guardian_status_sensor_refreshes_when_guardian_notifies_listeners():
@@ -233,6 +252,45 @@ def test_mode_select_without_guardian_matches_base_behavior():
     positional_only = [e.attr for e in select.create_entities(device)]
 
     assert with_none == positional_only
+
+
+def test_mode_select_exposes_native_schedule_readback():
+    device = _make_device()
+    device.values["native_auto_schedule"] = {"sunrise": {"hour": 6, "minute": 0, "ramp": 30}}
+    device.values["native_pro_schedule"] = [{"minute": 0, "channel_1": 10}]
+    guardian = _FakeGuardian()
+
+    mode_entity = next(e for e in select.create_entities(device, guardian) if e.attr == "mode")
+    mode_entity.internal_update()
+
+    assert mode_entity._attr_extra_state_attributes["auto_schedule"] == {
+        "sunrise": {"hour": 6, "minute": 0, "ramp": 30}
+    }
+    assert mode_entity._attr_extra_state_attributes["pro_schedule"] == [{"minute": 0, "channel_1": 10}]
+
+
+def test_mode_select_schedule_readback_is_null_before_any_readback():
+    device = _make_device()
+    mode_entity = select.FluvalSelect(device, "mode")
+
+    mode_entity.internal_update()
+
+    assert mode_entity._attr_extra_state_attributes["auto_schedule"] is None
+    assert mode_entity._attr_extra_state_attributes["pro_schedule"] is None
+
+
+def test_mode_select_schedule_readback_present_without_guardian():
+    """Schedule-readback attributes are not guardian-gated like override state is."""
+    device = _make_device()
+    device.values["native_auto_schedule"] = {"sunrise": {"hour": 6, "minute": 0, "ramp": 30}}
+
+    mode_entity = select.FluvalSelect(device, "mode")
+    mode_entity.internal_update()
+
+    assert mode_entity._attr_extra_state_attributes["auto_schedule"] == {
+        "sunrise": {"hour": 6, "minute": 0, "ramp": 30}
+    }
+    assert "override_active" not in mode_entity._attr_extra_state_attributes
 
 
 # ---------------------------------------------------------------------------

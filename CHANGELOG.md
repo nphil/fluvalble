@@ -5,6 +5,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.1.2]
+
+### Fixed
+- A wedged GATT read/write deep in the Bluetooth stack (observed against a bleak-esphome proxy) could hang forever while holding the Client/Device/Guardian locks that serialize every command, wedging the whole integration until a full Home Assistant restart - a single stuck op piled up three queued guardian checks plus a service call, all waiting on locks nothing would ever release. Every GATT-facing await (connect, read, write, notify, disconnect) is now bounded; a bounded timeout marks the client broken, best-effort disconnects, and raises so callers fail fast instead of hanging. `Device.command_transaction`/`serialized_device_command` add an overall per-command deadline that resets the connection (new `Device.async_reset_connection()`) on expiry. `ScheduleGuardian` bounds every check step, caps the whole check cycle, and skips (rather than queues) an interval trigger while a check is already running.
+- `fluvalble.set_native_auto_schedule` / `fluvalble.set_native_pro_schedule` could report success (and the guardian could report a completed correction) while the fixture's on-device schedule silently kept its old values - the write path never actually verified the fixture applied it. Both now re-read the schedule after writing and compare it against the request, retrying the write once on a mismatch before failing with a `HomeAssistantError` naming the mismatched field. The mode select entity now exposes the fixture's current `auto_schedule`/`pro_schedule` readback as attributes.
+- The guardian's schedule-drift repush (used when the fixture's on-device schedule no longer matches what was last programmed) passed a live-readback-shaped Auto schedule (`{"hour","minute","ramp"}` dicts) into packet builders that index sunrise/sunset positionally, raising `KeyError` on every attempt against real FACEBD or classic hardware - this correction path had never actually worked. Professional-schedule repushes against FACEBD, classic, or Plant Pro readbacks had the same class of bug for differently-shaped points. Both are now normalized before use.
+- A dead guardian (checks no longer completing, e.g. from an earlier version of the hang above) could keep reporting its last good status indefinitely. The guardian status sensor now reports a `stale` state once its last check is more than twice the check interval old, and the schedule-problem binary sensor also trips after staleness persists more than 3 check intervals.
+
 ## [1.1.1]
 
 ### Fixed

@@ -127,7 +127,8 @@
           "corrected": "Corrected",
           "failed": "Failed",
           "unreachable": "Unreachable",
-          "paused": "Paused"
+          "paused": "Paused",
+          "stale": "Stale"
         }
       },
       "guardian_last_check": {

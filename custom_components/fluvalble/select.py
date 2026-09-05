@@ -46,14 +46,23 @@ class FluvalSelect(FluvalEntity, SelectEntity):
         self._attr_options = attribute.get("options", [])
         self._attr_available = "default" in attribute and self.device.controls_available
 
-        if self.guardian is not None and self.attr == "mode":
-            # A manual write from Home Assistant while the guardian expects
-            # Auto/Professional shows up here as an active override, with the
-            # timestamp the guardian will restore the expected mode by.
-            self._attr_extra_state_attributes = {
-                "override_active": self.guardian.override_active,
-                "override_until": self.guardian.override_until,
+        if self.attr == "mode":
+            # Expose the fixture's current native schedule readback so
+            # automations can check it directly instead of parsing
+            # diagnostics - available regardless of whether a guardian is
+            # configured; None until the first successful readback.
+            attributes: dict[str, object] = {
+                "auto_schedule": self.device.values.get("native_auto_schedule"),
+                "pro_schedule": self.device.values.get("native_pro_schedule"),
             }
+            if self.guardian is not None:
+                # A manual write from Home Assistant while the guardian
+                # expects Auto/Professional shows up here as an active
+                # override, with the timestamp the guardian will restore the
+                # expected mode by.
+                attributes["override_active"] = self.guardian.override_active
+                attributes["override_until"] = self.guardian.override_until
+            self._attr_extra_state_attributes = attributes
 
         if self.hass:
             self._async_write_ha_state()

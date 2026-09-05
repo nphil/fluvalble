@@ -80,14 +80,20 @@ class FluvalSensor(FluvalEntity, SensorEntity):
 
 
 class FluvalGuardianStatusSensor(FluvalGuardianEntity, SensorEntity):
-    """Reports ScheduleGuardian's outcome from its most recent check."""
+    """Reports ScheduleGuardian's outcome from its most recent check.
+
+    Reads `effective_status`, not `status` directly: a wedged check leaves
+    `status` frozen at whatever the last *completed* check reported, so the
+    guardian derives a "stale" override from elapsed time once checks have
+    gone silent for too long - see `ScheduleGuardian.effective_status`.
+    """
 
     _attr_device_class = SensorDeviceClass.ENUM
     _attr_options = list(GUARDIAN_STATUSES)
 
     def internal_update(self) -> None:
         """Update the sensor state from the guardian."""
-        self._attr_native_value = self.guardian.status
+        self._attr_native_value = self.guardian.effective_status
         if self.hass:
             self._async_write_ha_state()
 

@@ -12,18 +12,20 @@ raises a Home Assistant repair when it cannot.
 ``ScheduleGuardian`` itself is a pure, ``hass``-free state machine: it is
 constructed with a device object exposing a small async duck-typed
 interface (``async_sync_clock``, ``async_read_state``, ``async_ensure_mode``,
-``async_set_native_auto_schedule``, ``async_set_native_pro_schedule``) and
-records outcomes as plain attributes. Nothing here imports or requires a
-running Home Assistant core, which makes the whole decision engine testable
-with a fake device and a fake clock. ``start_runner`` / ``async_setup_guardian``
-are the thin Home Assistant-facing half: they wire the engine to
-``async_track_time_interval`` and the device's connection listener.
+``async_set_native_auto_schedule``, ``async_set_native_pro_schedule``,
+``async_reset_connection``) and records outcomes as plain attributes.
+Nothing here imports or requires a running Home Assistant core, which makes
+the whole decision engine testable with a fake device and a fake clock.
+``start_runner`` / ``async_setup_guardian`` are the thin Home
+Assistant-facing half: they wire the engine to ``async_track_time_interval``
+and the device's connection listener.
 """
 
 from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+import contextlib
 from datetime import timedelta
 import logging
 import time
@@ -54,6 +56,8 @@ STATUS_CORRECTED = "corrected"
 STATUS_FAILED = "failed"
 STATUS_UNREACHABLE = "unreachable"
 STATUS_PAUSED = "paused"
+# Derived, never stored on `self.status` directly - see `effective_status`.
+STATUS_STALE = "stale"
 GUARDIAN_STATUSES = [
     STATUS_UNKNOWN,
     STATUS_OK,
@@ -61,6 +65,7 @@ GUARDIAN_STATUSES = [
     STATUS_FAILED,
     STATUS_UNREACHABLE,
     STATUS_PAUSED,
+    STATUS_STALE,
 ]
 
 # Guardian expected_mode option values that are actively enforced on the
@@ -75,6 +80,20 @@ _SUPERVISED_DEVICE_MODE = {
 # user configured a looser alert_after_failures - unreachable is a distinct,
 # always-on safety net separate from the configurable correction-failure count.
 UNREACHABLE_ALERT_THRESHOLD = 3
+
+# Per-step deadlines for one check cycle. Device already bounds a whole
+# public command (`DEFAULT_COMMAND_DEADLINE`, 60s) and Client bounds every
+# individual GATT op beneath that; these are tighter so a wedged step is
+# reported as this guardian's own "unreachable"/"failed" outcome - with a
+# connection reset - well before the Device-level backstop would even fire.
+CHECK_CLOCK_SYNC_TIMEOUT = 30.0
+CHECK_READ_STATE_TIMEOUT = 30.0
+CHECK_ENSURE_MODE_TIMEOUT = 30.0
+CHECK_SCHEDULE_REPUSH_TIMEOUT = 60.0
+# Hard cap on one whole check cycle, regardless of how many of the above
+# steps it runs - belt-and-suspenders against any future step that forgets
+# its own bound.
+CHECK_OVERALL_TIMEOUT = 120.0
 
 
 def issue_id_for_mac(mac: str) -> str:
@@ -155,11 +174,53 @@ class ScheduleGuardian:
 
     @property
     def problem(self) -> bool:
-        """Return whether the guardian currently needs the user's attention."""
+        """Return whether the guardian currently needs the user's attention.
+
+        A guardian that has gone stale (see `effective_status`) counts as a
+        problem once it has stayed stale for longer than
+        `UNREACHABLE_ALERT_THRESHOLD` check intervals - the same "more than
+        3 misses" bar `consecutive_unreachable` already uses, applied here
+        to a supervisor that has stopped running checks at all rather than
+        one that keeps checking and failing.
+        """
         return (
             self.consecutive_failures >= self.alert_after_failures
             or self.consecutive_unreachable > UNREACHABLE_ALERT_THRESHOLD
+            or self._stale_seconds() > UNREACHABLE_ALERT_THRESHOLD * self.check_interval_min * 60
         )
+
+    def _stale_seconds(self) -> float:
+        """Return seconds since the current check attempt began, or 0 if not applicable.
+
+        0 whenever staleness cannot yet be judged: no check has ever
+        started, or one is currently in flight (`_check_lock` held) - a
+        check bounded by `CHECK_OVERALL_TIMEOUT` merely running long is not
+        the same failure mode as the supervisor having stopped running
+        checks at all.
+        """
+        if self.last_check_at is None or self._check_lock.locked():
+            return 0.0
+        return max(0.0, self._now() - self.last_check_at)
+
+    @property
+    def effective_status(self) -> str:
+        """Return `status`, overridden with STATUS_STALE once checks have gone silent.
+
+        `status` only updates when a check *completes* (`_finish`), so a
+        wedged check used to leave it frozen at whatever the last completed
+        check reported - observed live: "ok", with the last check 20+
+        minutes stale against a 10-minute interval, a dead supervisor
+        showing green. `check_interval_min`'s HA-clock timer keeps ticking
+        independently of whether checks complete - that timer firing
+        repeatedly behind a stuck lock is exactly how the live wedge piled
+        up three queued checks - so it is a reliable heartbeat for this even
+        while checks themselves are wedged. With every step now bounded
+        (see module docstring) this should rarely trigger; that is exactly
+        why it has to be honest when it does.
+        """
+        if self._stale_seconds() > 2 * self.check_interval_min * 60:
+            return STATUS_STALE
+        return self.status
 
     def add_listener(self, callback: Callable[[], None]) -> Callable[[], None]:
         """Register a callback fired after every check and override transition."""
@@ -187,16 +248,43 @@ class ScheduleGuardian:
     # ------------------------------------------------------------------
 
     async def async_check(self) -> str:
-        """Run one full guardian check cycle and return its outcome status."""
+        """Run one full guardian check cycle and return its outcome status.
+
+        Bounded to `CHECK_OVERALL_TIMEOUT` regardless of how far the check
+        got - a step that somehow ignored its own deadline must still not
+        hold `_check_lock` forever, since every caller of `async_check` (the
+        interval timer, a connect event, the "check now" service) and
+        `async_end_override` all queue behind that same lock.
+        """
         async with self._check_lock:
-            return await self._async_check_locked()
+            try:
+                async with asyncio.timeout(CHECK_OVERALL_TIMEOUT):
+                    return await self._async_check_locked()
+            except TimeoutError:
+                _LOGGER.warning(
+                    "Fluval guardian check for %s exceeded its %ss overall deadline",
+                    getattr(self.device, "mac", "?"),
+                    CHECK_OVERALL_TIMEOUT,
+                    exc_info=True,
+                )
+                await self._async_reset_connection_quiet()
+                return self._finish(STATUS_UNREACHABLE)
 
     async def _async_check_locked(self) -> str:
         """Sync clock, read state, correct mode/schedule drift, report outcome."""
         self.last_check_at = self._now()
 
         try:
-            await self.device.async_sync_clock()
+            async with asyncio.timeout(CHECK_CLOCK_SYNC_TIMEOUT):
+                await self.device.async_sync_clock()
+        except TimeoutError:
+            _LOGGER.warning(
+                "Fluval guardian clock sync for %s exceeded its %ss deadline",
+                getattr(self.device, "mac", "?"),
+                CHECK_CLOCK_SYNC_TIMEOUT,
+                exc_info=True,
+            )
+            await self._async_reset_connection_quiet()
         except Exception:  # noqa: BLE001 - best effort; read_state below reports reachability
             _LOGGER.debug("Fluval guardian clock sync failed", exc_info=True)
 
@@ -303,7 +391,18 @@ class ScheduleGuardian:
 
     async def _try_ensure_mode(self, mode: str) -> bool:
         try:
-            confirmed = await self.device.async_ensure_mode(mode)
+            async with asyncio.timeout(CHECK_ENSURE_MODE_TIMEOUT):
+                confirmed = await self.device.async_ensure_mode(mode)
+        except TimeoutError:
+            _LOGGER.warning(
+                "Fluval guardian could not set mode to %s for %s within %ss",
+                mode,
+                getattr(self.device, "mac", "?"),
+                CHECK_ENSURE_MODE_TIMEOUT,
+                exc_info=True,
+            )
+            await self._async_reset_connection_quiet()
+            return False
         except Exception:  # noqa: BLE001 - transport failure means the correction failed
             _LOGGER.warning("Fluval guardian could not set mode to %s", mode, exc_info=True)
             return False
@@ -315,7 +414,17 @@ class ScheduleGuardian:
 
     async def _async_read_state_quiet(self) -> Any:
         try:
-            return await self.device.async_read_state()
+            async with asyncio.timeout(CHECK_READ_STATE_TIMEOUT):
+                return await self.device.async_read_state()
+        except TimeoutError:
+            _LOGGER.warning(
+                "Fluval guardian state read for %s exceeded its %ss deadline",
+                getattr(self.device, "mac", "?"),
+                CHECK_READ_STATE_TIMEOUT,
+                exc_info=True,
+            )
+            await self._async_reset_connection_quiet()
+            return None
         except Exception:  # noqa: BLE001 - unreachable is a normal, expected outcome
             _LOGGER.debug("Fluval guardian could not read device state", exc_info=True)
             return None
@@ -335,14 +444,29 @@ class ScheduleGuardian:
             return True, False
 
         try:
-            if target_mode == "automatic":
-                ok = await self.device.async_set_native_auto_schedule(self.expected_schedule)
-            else:
-                ok = await self.device.async_set_native_pro_schedule(self.expected_schedule)
+            async with asyncio.timeout(CHECK_SCHEDULE_REPUSH_TIMEOUT):
+                if target_mode == "automatic":
+                    ok = await self.device.async_set_native_auto_schedule(self.expected_schedule)
+                else:
+                    ok = await self.device.async_set_native_pro_schedule(self.expected_schedule)
+        except TimeoutError:
+            _LOGGER.warning(
+                "Fluval guardian schedule repush for %s exceeded its %ss deadline",
+                getattr(self.device, "mac", "?"),
+                CHECK_SCHEDULE_REPUSH_TIMEOUT,
+                exc_info=True,
+            )
+            await self._async_reset_connection_quiet()
+            return False, True
         except Exception:  # noqa: BLE001 - transport failure means the correction failed
             _LOGGER.warning("Fluval guardian could not repush the expected schedule", exc_info=True)
             return False, True
         return bool(ok), True
+
+    async def _async_reset_connection_quiet(self) -> None:
+        """Best-effort reset of the device's connection after a step timed out."""
+        with contextlib.suppress(Exception):
+            await self.device.async_reset_connection()
 
     def _finish(self, status: str) -> str:
         if status == STATUS_FAILED:
@@ -382,6 +506,20 @@ class ScheduleGuardian:
         # runs inline on the event loop, where creating the task is legal.
         @callback
         def _run_check_soon(*_args: Any) -> None:
+            if self._check_lock.locked():
+                # A check is already running (bounded by its own
+                # CHECK_OVERALL_TIMEOUT) - queuing another behind the same
+                # lock is exactly how one wedged check once piled up three
+                # queued ScheduleGuardian.async_check() calls on a live
+                # install. Still notify so time-derived state (STATUS_STALE,
+                # `problem`) can refresh for listeners even while a check is
+                # legitimately still running.
+                _LOGGER.debug(
+                    "Fluval guardian check for %s already running; skipping this trigger",
+                    getattr(self.device, "mac", "?"),
+                )
+                self._notify()
+                return
             hass.async_create_task(self.async_check())
 
         unsubs.append(

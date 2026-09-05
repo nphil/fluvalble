@@ -5,6 +5,8 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
+from homeassistant.exceptions import HomeAssistantError
+
 from custom_components.fluvalble.core import (
     LAMP_PROFILE_AQUASKY,
     LAMP_PROFILE_AQUASKY3,
@@ -326,6 +328,27 @@ def _facebd_client():
     )
 
 
+class _FakeVerifyClient:
+    """A client whose request_state() replays a canned readback into device.values.
+
+    Drives the *real* `_async_verify_native_auto/pro_schedule` methods (as
+    opposed to mocking them out) so the shape-normalization and comparison
+    logic itself is under test, not just the retry control flow.
+    """
+
+    def __init__(self, device, *, auto_schedule=None, pro_schedule=None):
+        self.device = device
+        self.auto_schedule = auto_schedule
+        self.pro_schedule = pro_schedule
+        self.raw_facebd = True
+
+    async def request_state(self):
+        if self.auto_schedule is not None:
+            self.device.values["native_auto_schedule"] = self.auto_schedule
+        if self.pro_schedule is not None:
+            self.device.values["native_pro_schedule"] = self.pro_schedule
+
+
 def test_initial_values_include_all_channels():
     device = _make_device()
 
@@ -568,6 +591,375 @@ async def _async_test_cancelled_command_releases_device_transaction():
 
     assert device._command_transaction_owner is None
     assert not device._command_transaction_lock.locked()
+
+
+
+# ---------------------------------------------------------------------------
+# command_transaction deadline: a stuck GATT op must not hold this lock (and
+# therefore every other command and every guardian check) forever.
+# ---------------------------------------------------------------------------
+
+
+def test_command_transaction_deadline_resets_connection_and_raises_timeout():
+    asyncio.run(_async_test_command_transaction_deadline_resets_connection_and_raises_timeout())
+
+
+async def _async_test_command_transaction_deadline_resets_connection_and_raises_timeout():
+    device = _make_device()
+    fake_client = AsyncMock()
+    device.client = fake_client
+
+    timed_out = False
+    try:
+        async with device.command_transaction(deadline=0.02):
+            await asyncio.sleep(3600)
+    except TimeoutError:
+        timed_out = True
+
+    assert timed_out
+    assert device.client is None
+    fake_client.stop.assert_awaited_once()
+    assert device._command_transaction_owner is None
+    assert not device._command_transaction_lock.locked()
+
+
+def test_serialized_device_command_converts_deadline_timeout_to_false():
+    asyncio.run(_async_test_serialized_device_command_converts_deadline_timeout_to_false())
+
+
+async def _async_test_serialized_device_command_converts_deadline_timeout_to_false():
+    """Every __init__.py service handler follows the same
+    `if not await device.async_xxx(...): raise HomeAssistantError(...)`
+    pattern - a wedged command converting to this method's normal falsy
+    failure return (rather than letting TimeoutError propagate) is what
+    lets that pattern fire cleanly instead of hanging the handler (and the
+    automation `Script.async_run` awaiting it) forever.
+    """
+    import custom_components.fluvalble.core.device as device_module
+
+    device = _make_device()
+    device.client = AsyncMock()
+
+    async def _hangs_forever(_self):
+        await asyncio.sleep(3600)
+
+    bounded = device_module.serialized_device_command(_hangs_forever, deadline=0.02)
+
+    result = await asyncio.wait_for(bounded(device), timeout=5)
+
+    assert result is False
+    assert device.diagnostics["last_error"] == "Fluval BLE command timed out after 0.02s and the connection was reset"
+
+    raised = False
+    try:
+        if not result:
+            raise HomeAssistantError(device.diagnostics.get("last_error") or "Fluval BLE command failed")
+    except HomeAssistantError:
+        raised = True
+    assert raised
+
+
+def test_async_reset_connection_discards_and_stops_the_client():
+    asyncio.run(_async_test_async_reset_connection_discards_and_stops_the_client())
+
+
+async def _async_test_async_reset_connection_discards_and_stops_the_client():
+    device = _make_device()
+    fake_client = AsyncMock()
+    device.client = fake_client
+
+    await device.async_reset_connection()
+
+    assert device.client is None
+    fake_client.stop.assert_awaited_once()
+
+
+def test_async_reset_connection_is_a_noop_without_a_client():
+    asyncio.run(_async_test_async_reset_connection_is_a_noop_without_a_client())
+
+
+async def _async_test_async_reset_connection_is_a_noop_without_a_client():
+    device = _make_device()
+    assert device.client is None
+
+    await device.async_reset_connection()
+
+    assert device.client is None
+
+
+def test_async_reset_connection_tolerates_a_failing_stop():
+    asyncio.run(_async_test_async_reset_connection_tolerates_a_failing_stop())
+
+
+async def _async_test_async_reset_connection_tolerates_a_failing_stop():
+    device = _make_device()
+    fake_client = AsyncMock()
+    fake_client.stop.side_effect = RuntimeError("disconnect blew up")
+    device.client = fake_client
+
+    await device.async_reset_connection()
+
+    assert device.client is None
+
+
+# ---------------------------------------------------------------------------
+# Native schedule write verification: a successful GATT write is not enough -
+# only a matching readback confirms the fixture actually applied it.
+# ---------------------------------------------------------------------------
+
+
+_LIVE_BUG_AUTO_SCHEDULE = {
+    "sunrise": (8, 0, 60),
+    "sunset": (20, 30, 45),
+    "sleep": (23, 15),
+    "day_levels": [40, 60, 60, 54, 0],
+    "night_levels": [0, 5, 0, 0, 10],
+}
+
+
+def test_native_auto_schedule_mismatch_retries_once_then_succeeds():
+    asyncio.run(_async_test_native_auto_schedule_mismatch_retries_once_then_succeeds())
+
+
+async def _async_test_native_auto_schedule_mismatch_retries_once_then_succeeds():
+    device = _make_device(product_id=546)
+    device.client = _facebd_client()
+    device._async_prepare_command = AsyncMock(return_value=True)
+    device._async_send_packet = AsyncMock(return_value=True)
+    device._async_verify_native_auto_schedule = AsyncMock(side_effect=["day_levels", None])
+
+    assert await device.async_set_native_auto_schedule(_LIVE_BUG_AUTO_SCHEDULE)
+
+    assert device._async_verify_native_auto_schedule.await_count == 2
+    # The whole write (schedule + mode packet) is retried, not just the read.
+    assert device._async_send_packet.await_count == 4
+    assert device.diagnostics["status"] == "native_auto_schedule_submitted"
+
+
+def test_native_auto_schedule_persistent_mismatch_fails_naming_the_field():
+    asyncio.run(_async_test_native_auto_schedule_persistent_mismatch_fails_naming_the_field())
+
+
+async def _async_test_native_auto_schedule_persistent_mismatch_fails_naming_the_field():
+    device = _make_device(product_id=546)
+    device.client = _facebd_client()
+    device._async_prepare_command = AsyncMock(return_value=True)
+    device._async_send_packet = AsyncMock(return_value=True)
+    device._async_verify_native_auto_schedule = AsyncMock(return_value="day_levels")
+
+    assert not await device.async_set_native_auto_schedule(_LIVE_BUG_AUTO_SCHEDULE)
+
+    assert device._async_verify_native_auto_schedule.await_count == 2
+    assert device._async_send_packet.await_count == 4
+    assert "day_levels" in device.diagnostics["last_error"]
+    assert device.diagnostics["status"] == "native_auto_schedule_unverified"
+
+
+def test_native_pro_schedule_mismatch_retries_once_then_succeeds():
+    asyncio.run(_async_test_native_pro_schedule_mismatch_retries_once_then_succeeds())
+
+
+async def _async_test_native_pro_schedule_mismatch_retries_once_then_succeeds():
+    device = _make_device(product_id=546)
+    device.client = _facebd_client()
+    device._async_prepare_command = AsyncMock(return_value=True)
+    device._async_send_packet = AsyncMock(return_value=True)
+    device._async_verify_native_pro_schedule = AsyncMock(side_effect=["points", None])
+    points = [
+        {"hour": 8, "minute": 0, "levels": [0, 0, 0, 0, 0]},
+        {"hour": 20, "minute": 0, "levels": [0, 0, 0, 0, 0]},
+        {"hour": 10, "minute": 0, "levels": [20, 20, 20, 20, 20]},
+        {"hour": 12, "minute": 0, "levels": [80, 70, 60, 50, 40]},
+    ]
+
+    assert await device.async_set_native_pro_schedule(points)
+
+    assert device._async_verify_native_pro_schedule.await_count == 2
+    assert device._async_send_packet.await_count == 4
+
+
+def test_native_pro_schedule_persistent_mismatch_fails():
+    asyncio.run(_async_test_native_pro_schedule_persistent_mismatch_fails())
+
+
+async def _async_test_native_pro_schedule_persistent_mismatch_fails():
+    device = _make_device(product_id=546)
+    device.client = _facebd_client()
+    device._async_prepare_command = AsyncMock(return_value=True)
+    device._async_send_packet = AsyncMock(return_value=True)
+    device._async_verify_native_pro_schedule = AsyncMock(return_value="points")
+    points = [
+        {"hour": 8, "minute": 0, "levels": [0, 0, 0, 0, 0]},
+        {"hour": 20, "minute": 0, "levels": [0, 0, 0, 0, 0]},
+        {"hour": 10, "minute": 0, "levels": [20, 20, 20, 20, 20]},
+        {"hour": 12, "minute": 0, "levels": [80, 70, 60, 50, 40]},
+    ]
+
+    assert not await device.async_set_native_pro_schedule(points)
+
+    assert "points" in device.diagnostics["last_error"]
+    assert device.diagnostics["status"] == "native_pro_schedule_unverified"
+
+
+def test_auto_schedule_write_reproduces_and_catches_the_live_stale_readback_bug():
+    """Live bug: a service call returned success and "confirmed" while the
+    fixture's readback stayed on its old day levels [68,100,100,90] instead
+    of the requested [40,60,60,54]. Exercises the *real* (unmocked) verify
+    path against a readback that never changed."""
+    asyncio.run(_async_test_auto_schedule_write_reproduces_and_catches_the_live_stale_readback_bug())
+
+
+async def _async_test_auto_schedule_write_reproduces_and_catches_the_live_stale_readback_bug():
+    device = _make_device(product_id=546)
+    device._async_prepare_command = AsyncMock(return_value=True)
+    device._async_send_packet = AsyncMock(return_value=True)
+    stale_readback = {
+        "sunrise": {"hour": 8, "minute": 0, "ramp": 60},
+        "sunset": {"hour": 20, "minute": 30, "ramp": 45},
+        "sleep": {"hour": 23, "minute": 15},
+        "day_levels": [68, 100, 100, 90, 0],
+        "night_levels": [0, 5, 0, 0, 10],
+    }
+    device.client = _FakeVerifyClient(device, auto_schedule=stale_readback)
+    requested = {
+        "sunrise": (8, 0, 60),
+        "sunset": (20, 30, 45),
+        "sleep": (23, 15),
+        "day_levels": [40, 60, 60, 54, 0],
+        "night_levels": [0, 5, 0, 0, 10],
+    }
+
+    assert not await device.async_set_native_auto_schedule(requested)
+
+    assert "day_levels" in device.diagnostics["last_error"]
+    assert device._async_send_packet.await_count == 4  # retried once, exactly as specified
+
+
+def test_auto_schedule_write_verified_against_matching_readback_keeps_values_populated():
+    """A verified write must repopulate device.values with the fresh
+    readback, not clear it - select.py's schedule-readback attributes and
+    the guardian's expected_schedule capture both depend on this."""
+    asyncio.run(_async_test_auto_schedule_write_verified_against_matching_readback_keeps_values_populated())
+
+
+async def _async_test_auto_schedule_write_verified_against_matching_readback_keeps_values_populated():
+    device = _make_device(product_id=546)
+    device._async_prepare_command = AsyncMock(return_value=True)
+    device._async_send_packet = AsyncMock(return_value=True)
+    matching_readback = {
+        "sunrise": {"hour": 8, "minute": 0, "ramp": 60},
+        "sunset": {"hour": 20, "minute": 30, "ramp": 45},
+        "sleep": {"hour": 23, "minute": 15},
+        "day_levels": [40, 60, 60, 54, 0],
+        "night_levels": [0, 5, 0, 0, 10],
+    }
+    device.client = _FakeVerifyClient(device, auto_schedule=matching_readback)
+    requested = {
+        "sunrise": (8, 0, 60),
+        "sunset": (20, 30, 45),
+        "sleep": (23, 15),
+        "day_levels": [40, 60, 60, 54, 0],
+        "night_levels": [0, 5, 0, 0, 10],
+    }
+
+    assert await device.async_set_native_auto_schedule(requested)
+
+    assert device.values["native_auto_schedule"] == matching_readback
+
+
+def test_auto_schedule_write_accepts_readback_shaped_sunrise_sunset_dicts():
+    """Confirmed real bug: guardian's schedule-drift repush feeds a captured
+    *readback* straight back into this method - sunrise/sunset there are
+    {"hour","minute","ramp"} dicts, not the service's plain tuples. The
+    packet builders index sunrise[0]/[1]/[2], so passing the dict straight
+    through used to raise KeyError, caught by guardian's broad except and
+    silently turning every schedule-drift correction into "failed" - the
+    guardian's own repush path has never actually worked against real
+    hardware. See `_normalized_time_ramp`."""
+    asyncio.run(_async_test_auto_schedule_write_accepts_readback_shaped_sunrise_sunset_dicts())
+
+
+async def _async_test_auto_schedule_write_accepts_readback_shaped_sunrise_sunset_dicts():
+    device = _make_device(product_id=546)
+    device.client = _facebd_client()
+    device._async_prepare_command = AsyncMock(return_value=True)
+    device._async_send_packet = AsyncMock(return_value=True)
+    device._async_verify_native_auto_schedule = AsyncMock(return_value=None)
+    readback_shaped_schedule = {
+        "sunrise": {"hour": 8, "minute": 0, "ramp": 60},
+        "sunset": {"hour": 20, "minute": 30, "ramp": 45},
+        "sleep": {"hour": 23, "minute": 15},
+        "day_levels": [80, 70, 60, 50, 40],
+        "night_levels": [0, 5, 0, 0, 10],
+    }
+
+    assert await device.async_set_native_auto_schedule(readback_shaped_schedule)
+
+    schedule_packet = device._async_send_packet.await_args_list[0].args[0]
+    decoded = protocol.decode_cbor_map(schedule_packet)
+    assert decoded[protocol.WIFI_AUTO_DAY_LEVELS_KEY] == bytes([80, 70, 60, 50, 40])
+    assert decoded[protocol.WIFI_AUTO_NIGHT_LEVELS_KEY] == bytes([0, 5, 0, 0, 10])
+
+
+def test_pro_schedule_write_accepts_plant_pro_readback_shaped_points():
+    """Plant Pro readback points are {"time","levels"}; the old shape-sniff
+    required "levels" present AND "time" absent to treat a point as native,
+    so this shape fell through to the generic red/green/blue/white
+    normalizer and silently zeroed every channel."""
+    asyncio.run(_async_test_pro_schedule_write_accepts_plant_pro_readback_shaped_points())
+
+
+async def _async_test_pro_schedule_write_accepts_plant_pro_readback_shaped_points():
+    device = _make_device(name="PlantPro_AABBCC", model="Plant Pro 4.0 Bluetooth LED", product_id=545)
+    device.client = SimpleNamespace(plant_pro_spp=True)
+    device._async_prepare_command = AsyncMock(return_value=True)
+    device._async_send_packet = AsyncMock(return_value=True)
+    device._async_verify_native_pro_schedule = AsyncMock(return_value=None)
+    spp_readback_points = [
+        {"time": "08:00", "levels": [10, 20, 30, 40, 50]},
+        {"time": "12:00", "levels": [50, 50, 50, 50, 50]},
+        {"time": "16:00", "levels": [30, 30, 30, 30, 30]},
+        {"time": "20:00", "levels": [0, 0, 0, 0, 0]},
+    ]
+
+    assert await device.async_set_native_pro_schedule(spp_readback_points)
+
+    packet = device._async_send_packet.await_args_list[0].args[0]
+    assert packet == protocol.spp_pro_schedule_packet(
+        [
+            {"hour": 8, "minute": 0, "levels": [10, 20, 30, 40, 50]},
+            {"hour": 12, "minute": 0, "levels": [50, 50, 50, 50, 50]},
+            {"hour": 16, "minute": 0, "levels": [30, 30, 30, 30, 30]},
+            {"hour": 20, "minute": 0, "levels": [0, 0, 0, 0, 0]},
+        ]
+    )
+
+
+def test_pro_schedule_write_accepts_wifi_readback_shaped_points():
+    """FACEBD/classic readback points are {"minute","channel_N"}; the old
+    shape-sniff required a "levels" key, so this shape fell through to the
+    generic normalizer expecting point["time"] and raised KeyError."""
+    asyncio.run(_async_test_pro_schedule_write_accepts_wifi_readback_shaped_points())
+
+
+async def _async_test_pro_schedule_write_accepts_wifi_readback_shaped_points():
+    device = _make_device(product_id=546)
+    device.client = _facebd_client()
+    device._async_prepare_command = AsyncMock(return_value=True)
+    device._async_send_packet = AsyncMock(return_value=True)
+    device._async_verify_native_pro_schedule = AsyncMock(return_value=None)
+    wifi_readback_points = [
+        {"minute": 480, "channel_1": 10, "channel_2": 20, "channel_3": 30, "channel_4": 40, "channel_5": 50},
+        {"minute": 720, "channel_1": 50, "channel_2": 50, "channel_3": 50, "channel_4": 50, "channel_5": 50},
+        {"minute": 960, "channel_1": 30, "channel_2": 30, "channel_3": 30, "channel_4": 30, "channel_5": 30},
+        {"minute": 1200, "channel_1": 0, "channel_2": 0, "channel_3": 0, "channel_4": 0, "channel_5": 0},
+    ]
+
+    assert await device.async_set_native_pro_schedule(wifi_readback_points)
+
+    packet = device._async_send_packet.await_args_list[0].args[0]
+    decoded = protocol.decode_cbor_map(packet)
+    assert decoded[protocol.WIFI_PRO_TIMES_KEY] == [480, 720, 960, 1200]
 
 
 def test_new_command_supersedes_long_channel_transition_between_frames():
@@ -1531,6 +1923,11 @@ async def _async_test_plant_pro_native_schedule_actions_write_fixture_packets():
     device.client = SimpleNamespace(plant_pro_spp=True)
     device._async_prepare_command = AsyncMock(return_value=True)
     device._async_send_packet = AsyncMock(return_value=True)
+    # Packet-construction test: the write-verification readback is exercised
+    # separately (see test_native_auto/pro_schedule_write_*_on_mismatch), so
+    # trust every write here without a real fixture to read back from.
+    device._async_verify_native_auto_schedule = AsyncMock(return_value=None)
+    device._async_verify_native_pro_schedule = AsyncMock(return_value=None)
     device.values["native_auto_schedule"] = {"stale": True}
     device.values["native_pro_schedule"] = [{"stale": True}]
     auto = {
@@ -1577,8 +1974,11 @@ async def _async_test_plant_pro_native_schedule_actions_write_fixture_packets():
     assert device.diagnostics["native_schedule_protocol"] == "plant_pro"
     assert device.diagnostics["native_pro_schedule_points"] == 4
     assert device.diagnostics["plant_pro_effect_schedule"][0]["effect"] == "Lightning"
-    assert "native_auto_schedule" not in device.values
-    assert "native_pro_schedule" not in device.values
+    # A verified write no longer discards the prior readback - it is only
+    # ever replaced by a fresher one - so these are untouched by the mocked,
+    # always-verified writes above.
+    assert device.values["native_auto_schedule"] == {"stale": True}
+    assert device.values["native_pro_schedule"] == [{"stale": True}]
 
 
 def test_five_channel_facebd_auto_schedule_writes_all_fixture_levels():
@@ -1590,6 +1990,7 @@ async def _async_test_five_channel_facebd_auto_schedule_writes_all_fixture_level
     device.client = _facebd_client()
     device._async_prepare_command = AsyncMock(return_value=True)
     device._async_send_packet = AsyncMock(return_value=True)
+    device._async_verify_native_auto_schedule = AsyncMock(return_value=None)
     schedule = {
         "sunrise": (8, 0, 60),
         "sunset": (20, 30, 45),

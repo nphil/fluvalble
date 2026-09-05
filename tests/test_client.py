@@ -823,3 +823,117 @@ def test_get_characteristic_matches_case_insensitively():
 
     assert found is characteristic
     assert found.uuid == stored
+
+
+# ---------------------------------------------------------------------------
+# Bounded GATT awaits - a wedged proxy/peripheral must fail one call, not
+# hang every Device/Guardian lock serialized behind it forever.
+# ---------------------------------------------------------------------------
+
+
+class _HangingGattClient:
+    """A connected client whose GATT calls never resolve on their own."""
+
+    def __init__(self, characteristics):
+        self.services = _FakeServices(characteristics)
+        self.is_connected = True
+        self.disconnect_calls = 0
+
+    async def read_gatt_char(self, _uuid):
+        await asyncio.sleep(3600)
+
+    async def write_gatt_char(self, _uuid, data, response):
+        await asyncio.sleep(3600)
+
+    async def disconnect(self):
+        self.disconnect_calls += 1
+        self.is_connected = False
+
+
+def test_establish_connection_timeout_is_bounded_and_marks_client_broken(monkeypatch):
+    asyncio.run(_async_test_establish_connection_timeout_is_bounded_and_marks_client_broken(monkeypatch))
+
+
+async def _async_test_establish_connection_timeout_is_bounded_and_marks_client_broken(monkeypatch):
+    monkeypatch.setattr(client_module, "CONNECT_DEADLINE", 0.02)
+    client = _make_client()
+
+    async def _hangs(*_args, **_kwargs):
+        await asyncio.sleep(3600)
+
+    with patch(
+        "custom_components.fluvalble.core.client.establish_connection",
+        new=AsyncMock(side_effect=_hangs),
+    ):
+        with pytest.raises(client_module.BleakOperationTimeoutError):
+            await asyncio.wait_for(client._ensure_client(), timeout=5)
+
+    assert client._broken is True
+    assert client.client is None
+
+
+def test_write_gatt_char_timeout_marks_broken_and_best_effort_disconnects(monkeypatch):
+    asyncio.run(_async_test_write_gatt_char_timeout_marks_broken_and_best_effort_disconnects(monkeypatch))
+
+
+async def _async_test_write_gatt_char_timeout_marks_broken_and_best_effort_disconnects(monkeypatch):
+    monkeypatch.setattr(client_module, "GATT_OP_DEADLINE", 0.02)
+    client = _make_client()
+    gatt = _HangingGattClient(_facebd_characteristics())
+    client.client = gatt
+    client.command_write_uuid = client_module.FACEBD_COMMAND_WRITE_UUIDS[0]
+    client.raw_facebd = True
+
+    with pytest.raises(client_module.BleakOperationTimeoutError):
+        await asyncio.wait_for(client._write_packet(client.command_write_uuid, b"\x01"), timeout=5)
+
+    assert client._broken is True
+    assert gatt.disconnect_calls == 1
+
+
+def test_broken_client_reconnects_even_though_still_reported_connected():
+    asyncio.run(_async_test_broken_client_reconnects_even_though_still_reported_connected())
+
+
+async def _async_test_broken_client_reconnects_even_though_still_reported_connected():
+    """A timed-out GATT op can leave bleak still reporting `is_connected`.
+
+    `_broken` must force a fresh physical connection anyway - the whole
+    point of marking it is that `is_connected` cannot be trusted after a
+    wedge, exactly the "fixture was connected (slot allocated)" live symptom.
+    """
+    client = _make_client()
+    stale = SimpleNamespace(is_connected=True, disconnect=AsyncMock())
+    client.client = stale
+    client._broken = True
+    fresh = SimpleNamespace(is_connected=True, start_notify=AsyncMock())
+    client._resolve_characteristics = AsyncMock()
+
+    with patch(
+        "custom_components.fluvalble.core.client.establish_connection",
+        new=AsyncMock(return_value=fresh),
+    ) as establish:
+        result = await client._ensure_client()
+
+    assert result is fresh
+    stale.disconnect.assert_awaited_once()
+    establish.assert_awaited_once()
+    assert client._broken is False
+
+
+def test_disconnect_timeout_is_bounded_and_swallowed():
+    asyncio.run(_async_test_disconnect_timeout_is_bounded_and_swallowed())
+
+
+async def _async_test_disconnect_timeout_is_bounded_and_swallowed():
+    client = _make_client()
+
+    async def _hangs():
+        await asyncio.sleep(3600)
+
+    client.client = SimpleNamespace(is_connected=True, disconnect=_hangs)
+
+    with patch.object(client_module, "DISCONNECT_DEADLINE", 0.02):
+        await asyncio.wait_for(client._safe_disconnect(), timeout=5)
+
+    assert client.client is None

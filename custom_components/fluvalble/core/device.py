@@ -1,6 +1,6 @@
 """A single Fluval BLE connected LED device."""
 
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 import asyncio
 import contextlib
 from dataclasses import dataclass
@@ -99,22 +99,63 @@ BLE_LOOKUP_RETRIES = 3
 PREVIEW_STEP_SECONDS = 2
 TRANSITION_STEP_SECONDS = 30
 DAY_MINUTES = 24 * 60
+# Overall ceiling on one public command's `command_transaction()` hold of
+# `_command_transaction_lock`. Client already bounds every individual
+# GATT-facing await, so this is a backstop - it exists for the rare case
+# a step inside Device itself (not Client) stalls, and for direct service
+# calls that have no per-step guardian-level timeout of their own. Kept
+# comfortably above Client's own worst case (30s connect + 15s per GATT
+# op) so it should never fire ahead of a more specific, more informative
+# Client-level timeout.
+DEFAULT_COMMAND_DEADLINE = 60.0
+
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
 
 def serialized_device_command(
-    method: Callable[Concatenate["Device", _P], Awaitable[_R]],
-) -> Callable[Concatenate["Device", _P], Awaitable[_R]]:
-    """Run one complete device command without interleaving another."""
+    method: Callable[Concatenate["Device", _P], Awaitable[_R]] | None = None,
+    *,
+    deadline: float = DEFAULT_COMMAND_DEADLINE,
+) -> Any:
+    """Run one complete device command without interleaving another.
 
-    @wraps(method)
-    async def wrapped(self: "Device", *args: _P.args, **kwargs: _P.kwargs) -> _R:
-        async with self.command_transaction():
-            return await method(self, *args, **kwargs)
+    Usable bare (`@serialized_device_command`) or parameterized
+    (`@serialized_device_command(deadline=90)`) for commands that
+    legitimately need longer than `DEFAULT_COMMAND_DEADLINE` - e.g. a
+    schedule write that re-reads and retries once on a verification
+    mismatch. Either way, `command_transaction()` enforces the deadline;
+    see its docstring for what happens when a command exceeds it.
+    """
 
-    return cast(Callable[Concatenate["Device", _P], Awaitable[_R]], wrapped)
+    def _decorate(
+        fn: Callable[Concatenate["Device", _P], Awaitable[_R]],
+    ) -> Callable[Concatenate["Device", _P], Awaitable[_R]]:
+        @wraps(fn)
+        async def wrapped(self: "Device", *args: _P.args, **kwargs: _P.kwargs) -> _R:
+            try:
+                async with self.command_transaction(deadline=deadline):
+                    return await fn(self, *args, **kwargs)
+            except TimeoutError:
+                # `command_transaction` already logged the warning+traceback
+                # and reset the connection; converting to this method's
+                # normal falsy failure value (rather than letting
+                # TimeoutError propagate) is what lets every existing
+                # `if not await device.async_xxx(...): raise
+                # HomeAssistantError(...)` service handler fire cleanly
+                # instead of surfacing a raw, unhandled TimeoutError.
+                self._set_diagnostic_error(
+                    "command_timeout",
+                    f"Fluval BLE command timed out after {deadline:g}s and the connection was reset",
+                )
+                return cast(_R, False)
+
+        return cast(Callable[Concatenate["Device", _P], Awaitable[_R]], wrapped)
+
+    if method is not None:
+        return _decorate(method)
+    return _decorate
 
 def _resolved_device_name(
     name: str | None,
@@ -150,6 +191,112 @@ def _local_now() -> datetime:
     configured one would render the wrong ramp position.
     """
     return datetime.now().astimezone()
+
+
+def _normalized_time_ramp(value: Any) -> tuple[int, int, int] | None:
+    """Normalize a sunrise/sunset value to a plain `(hour, minute, ramp)` tuple.
+
+    A caller-supplied schedule (service call) carries this as a 3-tuple; a
+    schedule captured from a live readback (`Device._record_native_schedule_
+    readback`, persisted as the guardian's `expected_schedule` and fed right
+    back into `async_set_native_auto_schedule` on drift) carries it as
+    `{"hour", "minute", "ramp"}` instead. The packet builders in `protocol`
+    only ever index `sunrise[0]/[1]/[2]`, so passing a readback dict straight
+    through raised `KeyError` on every guardian schedule-drift repush against
+    real hardware - normalizing once here, for both packet-building and
+    write-verification comparison, fixes that class of bug at the source.
+    """
+    if isinstance(value, dict):
+        try:
+            return (int(value["hour"]), int(value["minute"]), int(value.get("ramp", 0)))
+        except (KeyError, TypeError, ValueError):
+            return None
+    if isinstance(value, (list, tuple)) and len(value) == 3:
+        try:
+            return (int(value[0]), int(value[1]), int(value[2]))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _normalized_clock(value: Any) -> tuple[int, int] | None:
+    """Normalize a sleep value to a plain `(hour, minute)` tuple, or None.
+
+    Same dict-or-tuple ambiguity as `_normalized_time_ramp`, one field
+    shorter (no ramp).
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        try:
+            return (int(value["hour"]), int(value["minute"]))
+        except (KeyError, TypeError, ValueError):
+            return None
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        try:
+            return (int(value[0]), int(value[1]))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _auto_schedule_mismatch(
+    requested: dict[str, Any], readback: dict[str, Any] | None, *, channel_count: int
+) -> str | None:
+    """Return the first Auto-schedule field the readback does not confirm, or None.
+
+    `channel_count` truncates both sides before comparing levels: a 4-channel
+    fixture never stores (or reports back) values beyond its own channel
+    count, so comparing the full 5-value canonical list would always "mismatch"
+    on a trailing value nothing ever wrote.
+    """
+    if not isinstance(readback, dict):
+        return "schedule"
+    if _normalized_time_ramp(requested.get("sunrise")) != _normalized_time_ramp(readback.get("sunrise")):
+        return "sunrise"
+    if _normalized_time_ramp(requested.get("sunset")) != _normalized_time_ramp(readback.get("sunset")):
+        return "sunset"
+    if _normalized_clock(requested.get("sleep")) != _normalized_clock(readback.get("sleep")):
+        return "sleep"
+    try:
+        requested_day = [int(value) for value in (requested.get("day_levels") or [])][:channel_count]
+        readback_day = [int(value) for value in (readback.get("day_levels") or [])][:channel_count]
+    except (TypeError, ValueError):
+        return "day_levels"
+    if requested_day != readback_day:
+        return "day_levels"
+    try:
+        requested_night = [int(value) for value in (requested.get("night_levels") or [])][:channel_count]
+        readback_night = [int(value) for value in (readback.get("night_levels") or [])][:channel_count]
+    except (TypeError, ValueError):
+        return "night_levels"
+    if requested_night != readback_night:
+        return "night_levels"
+    return None
+
+
+def _pro_schedule_mismatch(
+    requested: list[dict[str, Any]], readback: list[dict[str, Any]] | None, *, channel_count: int
+) -> str | None:
+    """Return "points" if the readback does not confirm every requested point.
+
+    Both sides are already in the canonical `{"minute", "channel_1".."channel_5"}`
+    shape (see `Device._canonical_pro_points`) and sorted by minute, so this
+    is a plain equality check once levels are truncated to the fixture's own
+    channel count.
+    """
+    if not isinstance(readback, list):
+        return "points"
+    if len(requested) != len(readback):
+        return "points"
+    for requested_point, readback_point in zip(requested, readback, strict=True):
+        if requested_point["minute"] != readback_point.get("minute"):
+            return "points"
+        for index in range(1, channel_count + 1):
+            key = f"channel_{index}"
+            if int(requested_point.get(key, 0)) != int(readback_point.get(key, 0)):
+                return "points"
+    return None
 
 
 class Attribute(TypedDict, total=False):
@@ -325,8 +472,30 @@ class Device:
         return self.conn_info.get("active_connection_source_address")
 
     @contextlib.asynccontextmanager
-    async def command_transaction(self, *, supersede_transition: bool = True) -> AsyncIterator[None]:
-        """Serialize a complete command while allowing nested device helpers."""
+    async def command_transaction(
+        self, *, supersede_transition: bool = True, deadline: float = DEFAULT_COMMAND_DEADLINE
+    ) -> AsyncIterator[None]:
+        """Serialize a complete command while allowing nested device helpers.
+
+        Bounded to `deadline` seconds so a command stuck on an unbounded
+        await deep in Client/bleak cannot hold this lock - and therefore
+        every other command and every guardian check behind it - forever.
+        That is exactly how a live install wedged permanently: three
+        ``ScheduleGuardian.async_check()`` tasks piled up (one inside the
+        wedged GATT call, two waiting on the guardian's own lock behind it)
+        plus an HA automation's ``Script.async_run`` awaiting a service call
+        that shared this same lock, and nothing short of an HA restart
+        cleared it. On timeout the connection is reset (see
+        `async_reset_connection`) so the *next* command reconnects fresh,
+        and the exception is logged here with a traceback before
+        propagating - that traceback's innermost frame is the exact await
+        that wedged.
+
+        Nested calls on the same task (`self._command_transaction_owner is
+        task`) ride the outermost call's deadline instead of starting a new
+        one, so one bounded window covers a whole public command even when
+        it calls other `@serialized_device_command` helpers internally.
+        """
         task = asyncio.current_task()
         if task is not None and self._command_transaction_owner is task:
             self._command_transaction_depth += 1
@@ -342,11 +511,39 @@ class Device:
         if supersede_transition:
             self._command_generation += 1
         try:
-            yield
+            async with asyncio.timeout(deadline):
+                yield
+        except TimeoutError:
+            _LOGGER.warning(
+                "Fluval command for %s exceeded its %ss deadline; resetting the connection",
+                self.address,
+                deadline,
+                exc_info=True,
+            )
+            await self.async_reset_connection()
+            raise
         finally:
             self._command_transaction_depth = 0
             self._command_transaction_owner = None
             self._command_transaction_lock.release()
+
+    async def async_reset_connection(self) -> None:
+        """Discard the current Client so the next command reconnects from scratch.
+
+        Called after a command's `command_transaction` deadline expires:
+        bounding the stuck await stopped the *hang*, but the underlying
+        BleakClient may still be sitting mid-write with an adapter or proxy
+        that still considers the slot in use. Stopping it outright (rather
+        than trying to keep using it) is the only way to guarantee the next
+        command starts from a known-good state; `Client.stop()` already
+        best-effort disconnects and tears down its own background tasks, and
+        its status callback (`Device.set_connected(False)`) resets clock-sync
+        state the same way a real disconnect does.
+        """
+        client, self.client = self.client, None
+        if client is not None:
+            with contextlib.suppress(Exception):
+                await client.stop()
 
     def touch_seen(self, *, rssi: int | None = None, notify: bool = True) -> None:
         """Record successful advertisement, connection, or command activity."""
@@ -1064,56 +1261,97 @@ class Device:
             handler()
         return True
 
-    @serialized_device_command
+    @serialized_device_command(deadline=90.0)
     async def async_set_native_auto_schedule(
         self,
         schedule: dict[str, Any],
         *,
         activate: bool = True,
     ) -> bool:
-        """Store a protocol-native Auto schedule in the fixture."""
+        """Store a protocol-native Auto schedule in the fixture, verifying the write.
+
+        Writes, re-reads the schedule straight back from the fixture, and
+        compares it against what was requested; a mismatch retries the whole
+        write once before failing. A prior version trusted a successful GATT
+        write outright and returned True regardless - on a live install this
+        once left the fixture on its old day levels while the integration
+        reported success and confirmed, because the only readback check
+        `Client.send_now` runs (`_expected_state_for_packet`) never covers
+        FACEBD schedule keys.
+        """
+        sunrise = _normalized_time_ramp(schedule.get("sunrise"))
+        sunset = _normalized_time_ramp(schedule.get("sunset"))
+        if sunrise is None or sunset is None:
+            self._set_diagnostic_error("invalid_native_schedule", "Auto schedule requires sunrise and sunset times")
+            return False
+        sleep = _normalized_clock(schedule.get("sleep"))
+        day_levels = schedule["day_levels"]
+        night_levels = schedule["night_levels"]
+        canonical_request = {
+            "sunrise": sunrise,
+            "sunset": sunset,
+            "sleep": sleep,
+            "day_levels": [int(value) for value in day_levels],
+            "night_levels": [int(value) for value in night_levels],
+        }
+
         if not await self._async_prepare_command():
             return False
 
-        if self._uses_wifi_protocol():
-            packet = protocol.wifi_auto_schedule_packet(
-                sunrise=schedule["sunrise"],
-                sunset=schedule["sunset"],
-                sleep=schedule.get("sleep"),
-                day_levels=schedule["day_levels"],
-                night_levels=schedule["night_levels"],
-                channel_count=self._resolved_channel_count(),
-            )
-            native_protocol = "facebd"
-        elif self._uses_plant_pro_protocol():
-            packet = protocol.spp_auto_schedule_packet(
-                sunrise=schedule["sunrise"],
-                sunset=schedule["sunset"],
-                sleep=schedule.get("sleep"),
-                day_levels=schedule["day_levels"],
-                night_levels=schedule["night_levels"],
-            )
-            native_protocol = "plant_pro"
-        else:
-            packet = protocol.old_auto_schedule_packet(
-                sunrise=schedule["sunrise"],
-                sunset=schedule["sunset"],
-                sleep=schedule.get("sleep"),
-                day_levels=schedule["day_levels"],
-                night_levels=schedule["night_levels"],
-                channel_count=self._resolved_channel_count(),
-            )
-            native_protocol = "classic"
+        channel_count = self._resolved_channel_count()
+        for attempt in (1, 2):
+            if self._uses_wifi_protocol():
+                packet = protocol.wifi_auto_schedule_packet(
+                    sunrise=sunrise,
+                    sunset=sunset,
+                    sleep=sleep,
+                    day_levels=day_levels,
+                    night_levels=night_levels,
+                    channel_count=channel_count,
+                )
+                native_protocol = "facebd"
+            elif self._uses_plant_pro_protocol():
+                packet = protocol.spp_auto_schedule_packet(
+                    sunrise=sunrise,
+                    sunset=sunset,
+                    sleep=sleep,
+                    day_levels=day_levels,
+                    night_levels=night_levels,
+                )
+                native_protocol = "plant_pro"
+            else:
+                packet = protocol.old_auto_schedule_packet(
+                    sunrise=sunrise,
+                    sunset=sunset,
+                    sleep=sleep,
+                    day_levels=day_levels,
+                    night_levels=night_levels,
+                    channel_count=channel_count,
+                )
+                native_protocol = "classic"
 
-        if not await self._async_send_packet(packet):
-            return False
-        if activate and not await self._async_send_packet(self._native_mode_packet("automatic")):
-            return False
+            if not await self._async_send_packet(packet):
+                return False
+            if activate and not await self._async_send_packet(self._native_mode_packet("automatic")):
+                return False
+
+            mismatch = await self._async_verify_native_auto_schedule(canonical_request, channel_count=channel_count)
+            if mismatch is None:
+                break
+            if attempt == 2:
+                self._set_diagnostic_error(
+                    "native_auto_schedule_unverified",
+                    f"Fluval did not confirm the requested Auto schedule after writing it twice ({mismatch} mismatch)",
+                )
+                return False
+            _LOGGER.warning(
+                "Fluval Auto schedule write for %s unverified (%s mismatch); retrying once",
+                self.address,
+                mismatch,
+            )
+
         if activate:
             self.values["mode"] = "automatic"
-        # A successful write confirms submission, not readback. Discard any
-        # older fixture copy so native preview cannot render stale levels.
-        self.values.pop("native_auto_schedule", None)
         self.diagnostics.update(
             {
                 "status": "native_auto_schedule_submitted",
@@ -1124,6 +1362,17 @@ class Device:
         self._notify_diagnostics_throttled()
         return True
 
+    async def _async_verify_native_auto_schedule(self, requested: dict[str, Any], *, channel_count: int) -> str | None:
+        """Re-read the fixture's Auto schedule and return the first mismatched field, or None."""
+        if self.client is None:
+            return "unreachable"
+        try:
+            await self.client.request_state()
+        except (TimeoutError, BleakError) as err:
+            _LOGGER.debug("Unable to read back Fluval Auto schedule for verification", exc_info=err)
+            return "unreachable"
+        return _auto_schedule_mismatch(requested, self.values.get("native_auto_schedule"), channel_count=channel_count)
+
     def native_pro_schedule_limits(self) -> tuple[str, int, int]:
         """Return the APK-defined Professional-schedule limits for this fixture."""
         if self._uses_wifi_protocol():
@@ -1132,24 +1381,73 @@ class Device:
             return "plant_pro", protocol.SPP_MIN_PRO_POINTS, protocol.SPP_MAX_PRO_POINTS
         return "classic", protocol.OLD_MIN_PRO_POINTS, protocol.OLD_MAX_PRO_POINTS
 
-    @serialized_device_command
+    def _canonical_pro_points(self, points: Iterable[dict[str, Any]]) -> list[dict[str, Any]] | None:
+        """Reduce any native/generic Pro schedule point shape to sorted canonical points.
+
+        Points arrive in one of three shapes depending on caller: the
+        service's validated ``{"hour","minute","levels"}``, the generic
+        save_schedule ``{"time","channel_N"}``/legacy-color shape, or a live
+        readback - ``{"minute","channel_N"}`` for classic/FACEBD,
+        ``{"time","levels"}`` for Plant Pro/SPP. All three must compare and
+        re-encode identically, or the guardian's schedule-drift repush
+        (which feeds a captured readback straight back into
+        `async_set_native_pro_schedule`) silently corrupts the schedule it
+        is trying to restore - the Pro-schedule counterpart of the
+        sunrise/sunset dict-vs-tuple bug `_normalized_time_ramp` fixes for
+        Auto schedules. Returns ``None`` if any point cannot be parsed.
+        """
+        canonical: list[dict[str, Any]] = []
+        for point in points:
+            if not isinstance(point, dict):
+                return None
+            try:
+                if "hour" in point and "minute" in point:
+                    minute = (int(point["hour"]) * 60 + int(point["minute"])) % DAY_MINUTES
+                elif "minute" in point:
+                    minute = int(point["minute"]) % DAY_MINUTES
+                elif "time" in point:
+                    minute = self._parse_time_to_minute(str(point["time"]))
+                else:
+                    return None
+            except (TypeError, ValueError, IndexError):
+                return None
+
+            if isinstance(point.get("levels"), list):
+                raw_levels = point["levels"]
+            else:
+                raw_levels = [
+                    point.get(channel, point.get(color, 0))
+                    for channel, color in (
+                        ("channel_1", "red"),
+                        ("channel_2", "green"),
+                        ("channel_3", "blue"),
+                        ("channel_4", "white"),
+                        ("channel_5", "channel_5"),
+                    )
+                ]
+            try:
+                levels = [max(0, min(100, int(value))) for value in raw_levels]
+            except (TypeError, ValueError):
+                return None
+            levels = (levels + [0] * 5)[:5]
+            canonical.append({"minute": minute, **{f"channel_{index}": levels[index - 1] for index in range(1, 6)}})
+        return sorted(canonical, key=lambda item: item["minute"])
+
+    @serialized_device_command(deadline=90.0)
     async def async_set_native_pro_schedule(
         self,
         points: list[dict[str, Any]],
         *,
         activate: bool = True,
     ) -> bool:
-        """Store a protocol-native Professional schedule in the fixture."""
-        if points and all("time" not in point and "levels" in point for point in points):
-            normalized = [
-                {
-                    "minute": (int(point["hour"]) * 60) + int(point["minute"]),
-                    **{f"channel_{index}": int(level) for index, level in enumerate(point["levels"], start=1)},
-                }
-                for point in points
-            ]
-        else:
-            normalized = self._normalize_schedule_points(points)
+        """Store a protocol-native Professional schedule in the fixture, verifying the write."""
+        normalized = self._canonical_pro_points(points)
+        if normalized is None:
+            self._set_diagnostic_error(
+                "invalid_native_schedule",
+                "Each Professional point requires a time and channel levels",
+            )
+            return False
 
         if not protocol.SPP_MIN_PRO_POINTS <= len(normalized) <= protocol.SPP_MAX_PRO_POINTS:
             self._set_diagnostic_error(
@@ -1169,34 +1467,51 @@ class Device:
             )
             return False
 
-        if native_protocol == "facebd":
-            packet = protocol.wifi_pro_schedule_packet(
-                normalized,
-                channel_count=self._resolved_channel_count(),
-            )
-        elif native_protocol == "plant_pro":
-            spp_points = [
-                {
-                    "hour": point["minute"] // 60,
-                    "minute": point["minute"] % 60,
-                    "levels": [point.get(f"channel_{index}", 0) for index in range(1, 6)],
-                }
-                for point in normalized
-            ]
-            packet = protocol.spp_pro_schedule_packet(spp_points)
-        else:
-            packet = protocol.old_pro_schedule_packet(
-                normalized,
-                channel_count=self._resolved_channel_count(),
+        channel_count = self._resolved_channel_count()
+        for attempt in (1, 2):
+            if native_protocol == "facebd":
+                packet = protocol.wifi_pro_schedule_packet(
+                    normalized,
+                    channel_count=channel_count,
+                )
+            elif native_protocol == "plant_pro":
+                spp_points = [
+                    {
+                        "hour": point["minute"] // 60,
+                        "minute": point["minute"] % 60,
+                        "levels": [point.get(f"channel_{index}", 0) for index in range(1, 6)],
+                    }
+                    for point in normalized
+                ]
+                packet = protocol.spp_pro_schedule_packet(spp_points)
+            else:
+                packet = protocol.old_pro_schedule_packet(
+                    normalized,
+                    channel_count=channel_count,
+                )
+
+            if not await self._async_send_packet(packet):
+                return False
+            if activate and not await self._async_send_packet(self._native_mode_packet("professional")):
+                return False
+
+            mismatch = await self._async_verify_native_pro_schedule(normalized, channel_count=channel_count)
+            if mismatch is None:
+                break
+            if attempt == 2:
+                self._set_diagnostic_error(
+                    "native_pro_schedule_unverified",
+                    f"Fluval did not confirm the requested Professional schedule after writing it twice ({mismatch} mismatch)",
+                )
+                return False
+            _LOGGER.warning(
+                "Fluval Professional schedule write for %s unverified (%s mismatch); retrying once",
+                self.address,
+                mismatch,
             )
 
-        if not await self._async_send_packet(packet):
-            return False
-        if activate and not await self._async_send_packet(self._native_mode_packet("professional")):
-            return False
         if activate:
             self.values["mode"] = "professional"
-        self.values.pop("native_pro_schedule", None)
         self.diagnostics.update(
             {
                 "status": "native_pro_schedule_submitted",
@@ -1207,6 +1522,20 @@ class Device:
         )
         self._notify_diagnostics_throttled()
         return True
+
+    async def _async_verify_native_pro_schedule(
+        self, requested: list[dict[str, Any]], *, channel_count: int
+    ) -> str | None:
+        """Re-read the fixture's Professional schedule and return "points" on mismatch, or None."""
+        if self.client is None:
+            return "unreachable"
+        try:
+            await self.client.request_state()
+        except (TimeoutError, BleakError) as err:
+            _LOGGER.debug("Unable to read back Fluval Professional schedule for verification", exc_info=err)
+            return "unreachable"
+        readback = self._canonical_pro_points(self.values.get("native_pro_schedule") or [])
+        return _pro_schedule_mismatch(requested, readback, channel_count=channel_count)
 
     @serialized_device_command
     async def async_set_native_effect_schedule(self, windows: list[dict[str, Any]]) -> bool:

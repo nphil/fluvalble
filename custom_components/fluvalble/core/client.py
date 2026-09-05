@@ -28,6 +28,24 @@ STATE_NOTIFY_TIMEOUT = 0.75
 UNVERIFIED_WRITE_COPIES = 2
 CHUNK_WRITE_GAP = 0.01
 
+# Hard ceilings on every GATT-facing await. bleak (and BLE proxies such as
+# bleak-esphome) can wait forever on a response that will never arrive if
+# the physical link silently wedges while still reporting "connected" - a
+# live install hung permanently this way (three guardian checks and a
+# service call all piled up behind locks a wedged read/write never
+# released). Every establish/connect, read_gatt_char, write_gatt_char,
+# start_notify/stop_notify, and disconnect in this module goes through
+# `_bounded()` with one of these deadlines so a stuck peripheral fails the
+# one call in flight instead of hanging every caller behind it.
+CONNECT_DEADLINE = 30.0
+GATT_OP_DEADLINE = 15.0
+DISCONNECT_DEADLINE = 5.0
+
+
+class BleakOperationTimeoutError(BleakError):
+    """A bounded BLE operation exceeded its deadline; the link is presumed dead."""
+
+
 # Hardware capture from AquaSky 3.0 establishes this FACEBD split:
 #   facebd01 = raw CBOR command writes
 #   facebd02 = state/acknowledgement read + notify
@@ -134,8 +152,56 @@ class Client:
         self.last_expected_state: dict[int, object] = {}
         self.last_confirmed_state: dict[int, object] = {}
         self.last_verification_mismatches: dict[int, dict[str, object]] = {}
+        # Set by `_bounded()` whenever a GATT op times out. `_ensure_client`
+        # discards and reconnects instead of reusing a client left in this
+        # state, then clears it once a fresh connect+init sequence
+        # completes - a timeout while merely probing an optional candidate
+        # characteristic (e.g. one of several notify UUIDs) must not
+        # permanently poison a session that otherwise came up healthy.
+        self._broken = False
         self.last_command_at = 0.0
         self.connect_task = asyncio.create_task(self._connect())
+
+    async def _bounded(
+        self,
+        awaitable,
+        timeout: float,
+        description: str,
+        *,
+        disconnect: BleakClient | None = None,
+    ):
+        """Run one GATT-facing await with a hard deadline.
+
+        On timeout this marks the client broken (see `self._broken`), makes
+        a best-effort attempt to disconnect `disconnect` (pass the live
+        `BleakClient` for a load-bearing op such as a command write or the
+        main connect attempt; leave it `None` for an optional/best-effort op
+        such as a wake read or one candidate among several notify UUIDs,
+        where tearing down a connection that is otherwise fine would be
+        wrong), and raises `BleakOperationTimeoutError` - a `BleakError`
+        subclass, so it is caught by every existing `except BleakError`/
+        `except (TimeoutError, BleakError)` handler in this class without
+        changes - so the caller fails this one call fast instead of hanging.
+        """
+        try:
+            async with asyncio.timeout(timeout):
+                return await awaitable
+        except TimeoutError as err:
+            self.last_error = f"{description} timed out after {timeout:g}s"
+            _LOGGER.warning(
+                "Fluval BLE %s timed out after %ss; marking the link broken",
+                description,
+                timeout,
+                exc_info=True,
+            )
+            self._broken = True
+            if disconnect is not None:
+                with contextlib.suppress(Exception):
+                    async with asyncio.timeout(DISCONNECT_DEADLINE):
+                        await disconnect.disconnect()
+            raise BleakOperationTimeoutError(
+                f"Fluval BLE {description} timed out after {timeout:g}s"
+            ) from err
 
     def _get_characteristic(self, uuid: str) -> BleakGATTCharacteristic | None:
         """Return a characteristic if present, without raising on missing UUIDs."""
@@ -269,27 +335,32 @@ class Client:
         async with self._connection_lock:
             if self._stopping:
                 raise BleakError("Fluval BLE client is stopping")
-            if self.client and self.client.is_connected:
+            if self.client and self.client.is_connected and not self._broken:
                 return self.client
 
             stale_client = self.client
             self.client = None
             self._session_initialized = False
+            self._broken = False
             if stale_client is not None:
                 with contextlib.suppress(Exception):
-                    await asyncio.wait_for(stale_client.disconnect(), timeout=5)
+                    await asyncio.wait_for(stale_client.disconnect(), timeout=DISCONNECT_DEADLINE)
 
             device = self._current_device()
             self.connection_attempts += 1
             try:
-                client = await establish_connection(
-                    BleakClient,
-                    device,
-                    device.address,
-                    disconnected_callback=self._on_disconnected,
-                    max_attempts=CONNECT_RETRIES,
-                    timeout=CONNECT_TIMEOUT,
-                    ble_device_callback=self._current_device,
+                client = await self._bounded(
+                    establish_connection(
+                        BleakClient,
+                        device,
+                        device.address,
+                        disconnected_callback=self._on_disconnected,
+                        max_attempts=CONNECT_RETRIES,
+                        timeout=CONNECT_TIMEOUT,
+                        ble_device_callback=self._current_device,
+                    ),
+                    CONNECT_DEADLINE,
+                    "connect",
                 )
             except (TimeoutError, BleakError, EOFError) as err:
                 self.last_error = f"connect failed: {type(err).__name__}: {err}"
@@ -297,7 +368,7 @@ class Client:
 
             if self._stopping:
                 with contextlib.suppress(Exception):
-                    await asyncio.wait_for(client.disconnect(), timeout=5)
+                    await asyncio.wait_for(client.disconnect(), timeout=DISCONNECT_DEADLINE)
                 raise BleakError("Fluval BLE client stopped while connecting")
 
             self.client = client
@@ -305,11 +376,20 @@ class Client:
                 await self._resolve_characteristics()
                 for uuid in self.notify_uuids:
                     with contextlib.suppress(BleakError):
-                        await client.start_notify(uuid, self.notify_callback)
+                        # No `disconnect=` here: several candidate UUIDs are
+                        # tried in turn (matching the existing BleakError
+                        # suppression below), so one timing out must not tear
+                        # down a connection the remaining candidates could
+                        # still subscribe on.
+                        await self._bounded(
+                            client.start_notify(uuid, self.notify_callback),
+                            GATT_OP_DEADLINE,
+                            f"start_notify {uuid}",
+                        )
             except Exception:
                 self.client = None
                 with contextlib.suppress(Exception):
-                    await asyncio.wait_for(client.disconnect(), timeout=5)
+                    await asyncio.wait_for(client.disconnect(), timeout=DISCONNECT_DEADLINE)
                 raise
 
             if self.connection_ready_callback:
@@ -327,6 +407,12 @@ class Client:
             if self.status_callback:
                 self.status_callback(True)
             self.last_error = None
+            # A timeout while probing an optional notify candidate above is
+            # not a reason to distrust a session that otherwise came up
+            # clean - only a timeout on a *live* connection's traffic
+            # (write/read/heartbeat, after this point) should force the next
+            # `_ensure_client()` call to reconnect from scratch.
+            self._broken = False
 
             return client
 
@@ -443,7 +529,11 @@ class Client:
 
             if self.wake_read_uuid:
                 with contextlib.suppress(BleakError):
-                    await client.read_gatt_char(self.wake_read_uuid)
+                    await self._bounded(
+                        client.read_gatt_char(self.wake_read_uuid),
+                        GATT_OP_DEADLINE,
+                        "wake read",
+                    )
 
             if self.ready_callback:
                 await self.ready_callback()
@@ -490,7 +580,11 @@ class Client:
                 while time.time() < self.ping_time and not self._stopping and client is self.client:
                     if self.wake_read_uuid:
                         with contextlib.suppress(BleakError):
-                            await client.read_gatt_char(self.wake_read_uuid)
+                            await self._bounded(
+                                client.read_gatt_char(self.wake_read_uuid),
+                                GATT_OP_DEADLINE,
+                                "heartbeat wake read",
+                            )
                     if self.send_data:
                         if time.time() < self.send_time:
                             await self._write_packet(self.command_write_uuid, self.send_data)
@@ -569,7 +663,12 @@ class Client:
                 to_hex(data) if index == 0 else "(cont)",
                 to_hex(payload),
             )
-            await self.client.write_gatt_char(uuid, data=payload, response=response)
+            await self._bounded(
+                self.client.write_gatt_char(uuid, data=payload, response=response),
+                GATT_OP_DEADLINE,
+                f"write {uuid}",
+                disconnect=self.client,
+            )
             if index + 1 < len(payloads):
                 await asyncio.sleep(CHUNK_WRITE_GAP)
 
@@ -582,7 +681,11 @@ class Client:
 
         if self.wake_read_uuid:
             with contextlib.suppress(BleakError):
-                await client.read_gatt_char(self.wake_read_uuid)
+                await self._bounded(
+                    client.read_gatt_char(self.wake_read_uuid),
+                    GATT_OP_DEADLINE,
+                    "wake read",
+                )
 
         if self.plant_pro_spp:
             await self._wait_for_command_gap()
@@ -596,7 +699,11 @@ class Client:
             # only a wake byte on facebd81 and the real CBOR map on facebd80/02.
             for read_uuid in self.state_read_uuids or [self.notify_uuid]:
                 try:
-                    data = await client.read_gatt_char(read_uuid)
+                    data = await self._bounded(
+                        client.read_gatt_char(read_uuid),
+                        GATT_OP_DEADLINE,
+                        f"state read {read_uuid}",
+                    )
                 except BleakError as err:
                     _LOGGER.debug("Fluval state read failed from %s", read_uuid, exc_info=err)
                     continue
@@ -665,7 +772,11 @@ class Client:
                 client = await self._ensure_client()
                 if self.wake_read_uuid:
                     with contextlib.suppress(BleakError):
-                        await client.read_gatt_char(self.wake_read_uuid)
+                        await self._bounded(
+                            client.read_gatt_char(self.wake_read_uuid),
+                            GATT_OP_DEADLINE,
+                            "wake read",
+                        )
 
                 await self._wait_for_command_gap()
 
@@ -742,7 +853,7 @@ class Client:
         self._session_initialized = False
         if client:
             with contextlib.suppress(Exception):
-                await asyncio.wait_for(client.disconnect(), timeout=5)
+                await asyncio.wait_for(client.disconnect(), timeout=DISCONNECT_DEADLINE)
         if self.status_callback:
             self.status_callback(False)
 
