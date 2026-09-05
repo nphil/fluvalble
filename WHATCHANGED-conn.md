@@ -100,6 +100,25 @@ supervise) live entirely in `Device` — which explicitly passes
 means the transport layer's own default stays a no-op, and every existing
 `Client`-level test needed zero changes.
 
+**Known residual interaction, deliberately left as-is:** `_persistent()` is
+`active_time == 0 OR hold_connection` (an OR, not an override) so that
+`hold_connection`'s frozen semantics (agreed with TestsCI-3, see
+`tests/test_connection_policy.py`'s module docstring) stay exactly
+"persistent when either says so" — flipping `hold_connection` to `False`
+does not, by itself, stop the `Client`-level supervisor from self-healing a
+dropped connection for an entry whose numeric `active_time` option is
+explicitly `0`. In practice this cannot surface as "the switch didn't work":
+`Device` always drives `hold_connection` as the sole persistence knob and
+leaves the numeric option at its finite default (120s) unless a user
+deliberately sets *both* "persistent" (0) and turns the switch off — a
+self-contradictory combination. The `Device`-level `_connection_parked()`
+guard (keyed on `hold_connection` alone, see below) is what actually
+enforces "stay off until True" for every real command/read/Guardian-check
+path regardless of this Client-level nuance, so the observable contract
+("hold_connection=False refuses new connections") holds either way — only
+the *heartbeat* keeps quietly redialing in that edge case, which harms
+nothing since every consumer already refuses to use the resulting link.
+
 ### `core/device.py`
 - `hold_connection` property + setter (backed by `self._hold_connection`,
   read from `config_data["hold_connection"]`, default `True`). Setter

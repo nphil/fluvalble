@@ -181,3 +181,12 @@ field. Changed to `data={**entry.options, **user_input}`.
 - Corrected the reload claim above after review - see the `expected_schedule`
   bullet; the direct `set_expected_schedule()` call, not a reload, is what
   keeps the live guardian in sync.
+- Follow-up sweep: `DOMAIN` also went unused in `guardian.py` once the
+  per-unload delete moved out - removed. Factored the issue-id format into
+  `issue_id_for_mac(mac)` (used by `async_remove_entry`, which only has the
+  entry's stored MAC, not a live Device) with `issue_id_for(device)` now a
+  thin wrapper over it, so the two call sites can't silently diverge.
+  `async_remove_entry` isn't covered by the existing suite (no test
+  constructs a permanent-removal scenario) - verified with a throwaway
+  script (deleted after): correct issue_id computed from `entry.data["mac"]`
+  and deleted, and a no-op (no call, no raise) when the entry has no MAC.
