@@ -110,7 +110,11 @@ def _stub_homeassistant():
     ha_core.CoreState = enum.Enum("CoreState", {"running": "running"})
     ha_core.HomeAssistant = MagicMock
     ha_core.ServiceCall = MagicMock
-    ha_core.callback = lambda f: f  # passthrough decorator
+    def _callback(f):  # mirrors homeassistant.core.callback: mark for loop dispatch
+        f._hass_callback = True
+        return f
+
+    ha_core.callback = _callback
 
     # ---- homeassistant.config_entries ----
     class _FakeConfigEntry:

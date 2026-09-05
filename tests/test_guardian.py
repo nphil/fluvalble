@@ -591,3 +591,42 @@ def test_add_listener_fires_on_override_start_and_end():
 
     _run(guardian.async_end_override())
     assert calls[-1] == (False, None)
+
+
+# ---------------------------------------------------------------------------
+# HA runner: the interval callback must be dispatched on the event loop
+# ---------------------------------------------------------------------------
+
+
+def test_runner_registers_interval_callback_marked_for_loop_dispatch(monkeypatch):
+    """async_track_time_interval runs a plain function in an executor thread,
+    where hass.async_create_task is unsafe (HA logged this every interval on
+    the live install). The registered callable must carry HA's loop-dispatch
+    marker so the check is created on the event loop."""
+    from unittest.mock import MagicMock
+
+    from custom_components.fluvalble.core import guardian as guardian_module
+
+    captured = {}
+
+    def fake_track(hass, action, interval):
+        captured["action"] = action
+        captured["interval"] = interval
+        return lambda: None
+
+    monkeypatch.setattr(guardian_module, "async_track_time_interval", fake_track)
+
+    device = _FakeDevice(mode="automatic")
+    device.register_connection_listener = lambda cb: (lambda: None)
+    guardian = ScheduleGuardian(device, expected_mode="auto", check_interval_min=7)
+    hass = MagicMock()
+    # hass is a mock, so close each coroutine it is handed instead of leaking
+    # a never-awaited ScheduleGuardian.async_check().
+    hass.async_create_task.side_effect = lambda coro: coro.close()
+    unsub = guardian.start_runner(hass)
+
+    assert getattr(captured["action"], "_hass_callback", False) is True
+    assert captured["interval"].total_seconds() == 7 * 60
+    # The initial check and any tick both create the task on the loop side.
+    hass.async_create_task.assert_called()
+    unsub()

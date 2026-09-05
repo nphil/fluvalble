@@ -29,7 +29,7 @@ import logging
 import time
 from typing import Any
 
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.event import async_track_time_interval
 
 from . import (
@@ -375,13 +375,19 @@ class ScheduleGuardian:
         """
         unsubs: list[Callable[[], None]] = []
 
-        def _run_check_soon() -> None:
+        # ``@callback`` matters: async_track_time_interval runs a plain function
+        # in an executor thread, and hass.async_create_task from a thread is
+        # unsafe (HA logs "calls hass.async_create_task from a thread other
+        # than the event loop" every interval). Marked as a loop callback it
+        # runs inline on the event loop, where creating the task is legal.
+        @callback
+        def _run_check_soon(*_args: Any) -> None:
             hass.async_create_task(self.async_check())
 
         unsubs.append(
             async_track_time_interval(
                 hass,
-                lambda _now: _run_check_soon(),
+                _run_check_soon,
                 timedelta(minutes=max(1, self.check_interval_min)),
             )
         )

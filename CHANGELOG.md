@@ -5,6 +5,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.0.2]
+
+### Fixed
+- Schedule Guardian interval runner is a Home Assistant loop callback; the previous plain function ran in an executor thread and tripped HA's thread-safety check every interval.
+
 ## [1.0.1] - 2026-09-05
 
 ### Changed
