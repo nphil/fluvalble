@@ -114,9 +114,11 @@ class FluvalLight(FluvalEntity, LightEntity):
             extra_attributes["scheduled_levels"] = list(levels)
         self._attr_extra_state_attributes = extra_attributes
 
-        if source != "reported":
-            # Auto/Pro: nothing is "on" over classic BLE, so derive it from
-            # whatever the onboard schedule says the fixture is doing now.
+        if source == "schedule":
+            # Auto/Pro over classic BLE reports no live levels, so derive "on"
+            # from what the onboard schedule says the fixture is doing now.
+            # "unknown" keeps the reported led_on_off (set above) rather than
+            # asserting off - Plant Pro fixtures report live state in every mode.
             self._attr_is_on = bool(levels) and any(level > 0 for level in levels)
 
         # Only override the reported/commanded channel values when the

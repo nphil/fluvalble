@@ -5,6 +5,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.1.1]
+
+### Fixed
+- Light `is_on` is derived from the onboard schedule only when the schedule produced a reading; an `unknown` level source keeps the reported on/off state (Plant Pro fixtures without an active client were forced off).
+
 ## [1.1.0]
 
 ### Removed
