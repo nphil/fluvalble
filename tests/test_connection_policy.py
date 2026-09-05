@@ -1,15 +1,25 @@
 """Tests for connection-lifecycle hardening: hold_connection, backoff, the
 connect-time clock sync, async_ensure_mode, and async_read_state.
 
-Frozen surface confirmed by FluvalConn over hub:
+v1.0.1 redefinition (this fork stops permanently holding the single BLE
+central by default - see WHATCHANGED-v101.md):
 - `Device.hold_connection` (bool property) backed by `self._hold_connection`,
-  default True from config_data["hold_connection"]. Setter=False parks the
-  client (ping_time=0, cancels ping_future, blocks new connects via a
-  `_connection_parked()` guard in `_async_ensure_client`). Setter=True wakes
-  it back up and calls `client.ping()`. Both propagate to a mirrored
-  `Client.hold_connection` bool (new ctor param, default False so existing
-  direct-Client tests are untouched); a Client is persistent when
-  `active_time == 0 OR hold_connection is True`.
+  default **False** from config_data["hold_connection"]. `False` is
+  connect-on-demand, not "parked": it no longer blocks
+  `_async_ensure_client()`/`_async_prepare_command()`/`async_sync_clock()`/
+  `async_read_state()` from connecting - commands and Guardian checks still
+  connect whenever they need to, and the client disconnects again after
+  `active_time` of inactivity. Setter=False only collapses the client's idle
+  deadline (ping_time=0, cancels ping_future) so an *already held* link is
+  released promptly; setter=True re-arms persistence and calls
+  `client.ping()`. Both propagate to a mirrored `Client.hold_connection`
+  bool (ctor param, default False so existing direct-Client tests are
+  untouched); a Client is persistent when
+  `active_time == 0 OR hold_connection is True`. `update_ble()` still only
+  eagerly constructs a `Client` (which itself spawns a real connect attempt)
+  when `hold_connection` is already True at first advertisement - on-demand
+  creation happens lazily instead, the first time a check or command calls
+  `_async_ensure_client()`.
 - `register_connection_listener(cb)`: NOT fired at registration, only on
   future `set_connected()` transitions; additive to updates_connect /
   updates_component; returns an unsubscribe closure.
@@ -113,14 +123,14 @@ def _run(coro):
 # ---------------------------------------------------------------------------
 
 
-def test_hold_connection_defaults_true():
+def test_hold_connection_defaults_false():
     device = _make_device()
-    assert device.hold_connection is True
-
-
-def test_hold_connection_reads_false_from_config_data():
-    device = _make_device(hold_connection=False)
     assert device.hold_connection is False
+
+
+def test_hold_connection_reads_true_from_config_data():
+    device = _make_device(hold_connection=True)
+    assert device.hold_connection is True
 
 
 def test_hold_connection_setter_delegates_to_the_client_when_one_exists():
@@ -191,23 +201,26 @@ def test_client_hold_connection_setter_is_a_noop_when_value_is_unchanged():
 
 
 # ---------------------------------------------------------------------------
-# hold_connection: blocks new connects while parked
+# hold_connection: connects on demand regardless of state (v1.0.1 - no longer
+# "parked"; only Client._persistent()/idle-disconnect timing differs)
 # ---------------------------------------------------------------------------
 
 
-def test_async_ensure_client_blocked_while_hold_connection_false():
-    _run(_async_test_async_ensure_client_blocked_while_hold_connection_false())
+def test_async_ensure_client_connects_on_demand_when_hold_connection_false():
+    _run(_async_test_async_ensure_client_connects_on_demand_when_hold_connection_false())
 
 
-async def _async_test_async_ensure_client_blocked_while_hold_connection_false():
+async def _async_test_async_ensure_client_connects_on_demand_when_hold_connection_false():
+    """hold_connection=False must still let a Guardian check or command connect."""
     device = _make_device(hold_connection=False)
     device._async_find_device = AsyncMock(return_value=_ble_device())
 
-    result = await device._async_ensure_client()
+    with patch("asyncio.create_task", side_effect=lambda coro: _FakeTask(coro)):
+        result = await device._async_ensure_client()
 
-    assert result is False
-    assert device.client is None
-    device._async_find_device.assert_not_awaited()
+    assert result is True
+    assert device.client is not None
+    device._async_find_device.assert_awaited_once()
 
 
 def test_async_ensure_client_proceeds_normally_when_hold_connection_true():
@@ -551,16 +564,20 @@ def test_async_ensure_mode_returns_none_when_no_mode_could_ever_be_confirmed():
     assert result is None
 
 
-def test_async_ensure_mode_returns_none_while_parked():
-    """hold_connection=False blocks the connection _async_prepare_command needs."""
+def test_async_prepare_command_connects_on_demand_when_hold_connection_false():
+    _run(_async_test_async_prepare_command_connects_on_demand_when_hold_connection_false())
+
+
+async def _async_test_async_prepare_command_connects_on_demand_when_hold_connection_false():
+    """hold_connection=False is on-demand, not parked - the connect must still happen."""
     device = _make_device(hold_connection=False)
-    device.values["mode"] = "manual"
-    device._async_send_packet = AsyncMock(return_value=True)
+    device.client = _classic_client_stub(ensure_connected=AsyncMock(return_value=True))
+    device._async_ensure_client = AsyncMock(return_value=True)
 
-    result = _run(device.async_ensure_mode("automatic"))
+    result = await device._async_prepare_command()
 
-    assert result is None
-    device._async_send_packet.assert_not_awaited()
+    assert result is True
+    device._async_ensure_client.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

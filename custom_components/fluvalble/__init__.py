@@ -115,6 +115,28 @@ def _store_entry_runtime_data(
         entry.runtime_data = runtime
 
 
+def _async_lookup_registry_device(
+    registry: dr.DeviceRegistry, mac: str, entry_id: str | None
+) -> Any:
+    """Look up this integration's device registry entry for one MAC.
+
+    Home Assistant Core 2026.8 deprecated the ambiguous
+    `DeviceRegistry.async_get_device(identifiers=...)` in favor of
+    `async_get_device_by_identifier(identifier, config_entry_id)`, which is
+    unambiguous because it is scoped to a single config entry (see the HA
+    developer blog, "Devices are restricted to a single config entry").
+    This integration's HACS floor (2026.1.0) predates that helper, so detect
+    it at runtime and fall back to the legacy `identifiers=` form - and to
+    that same fallback when `entry_id` isn't known yet - rather than pinning
+    to one HA generation.
+    """
+    identifier = (DOMAIN, mac.upper())
+    lookup_by_identifier = getattr(registry, "async_get_device_by_identifier", None)
+    if lookup_by_identifier is not None and entry_id is not None:
+        return lookup_by_identifier(identifier, config_entry_id=entry_id)
+    return registry.async_get_device(identifiers={identifier})
+
+
 @callback
 def _sync_firmware_version_to_device_registry(hass: HomeAssistant, device: Device) -> None:
     """Publish fixture-reported firmware through standard HA device info."""
@@ -122,7 +144,7 @@ def _sync_firmware_version_to_device_registry(hass: HomeAssistant, device: Devic
         return
 
     registry = dr.async_get(hass)
-    registry_device = registry.async_get_device(identifiers={(DOMAIN, device.mac.upper())})
+    registry_device = _async_lookup_registry_device(registry, device.mac, device.entry_id)
     if registry_device is None or registry_device.sw_version == device.firmware_version:
         return
     registry.async_update_device(registry_device.id, sw_version=device.firmware_version)
@@ -145,7 +167,7 @@ def _sync_product_identity(hass: HomeAssistant, entry: FluvalConfigEntry, device
         hass.config_entries.async_update_entry(entry, data=data)
 
     registry = dr.async_get(hass)
-    registry_device = registry.async_get_device(identifiers={(DOMAIN, device.mac.upper())})
+    registry_device = _async_lookup_registry_device(registry, device.mac, entry.entry_id)
     if registry_device is not None and registry_device.model != device.model_name:
         registry.async_update_device(registry_device.id, model=device.model_name)
 

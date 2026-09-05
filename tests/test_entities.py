@@ -759,7 +759,7 @@ def test_reported_firmware_updates_standard_device_registry_info():
     device = _make_device()
     device.firmware_version = "14"
     registry_device = SimpleNamespace(id="device_1", sw_version=None)
-    registry = MagicMock()
+    registry = MagicMock(spec=["async_get_device", "async_update_device"])
     registry.async_get_device.return_value = registry_device
 
     with patch.object(integration.dr, "async_get", return_value=registry, create=True):
@@ -769,16 +769,39 @@ def test_reported_firmware_updates_standard_device_registry_info():
     registry.async_update_device.assert_called_once_with("device_1", sw_version="14")
 
 
+def test_firmware_sync_prefers_the_config_entry_scoped_lookup_when_ha_supports_it():
+    """HA >= 2026.8 exposes async_get_device_by_identifier(); prefer the
+    unambiguous, config-entry-scoped lookup over the deprecated identifiers=
+    form of async_get_device() whenever it (and a known entry_id) exist."""
+    import custom_components.fluvalble as integration
+
+    device = _make_device()
+    device.firmware_version = "14"
+    device.entry_id = "test-entry-id"
+    registry_device = SimpleNamespace(id="device_1", sw_version=None)
+    registry = MagicMock(spec=["async_get_device_by_identifier", "async_get_device", "async_update_device"])
+    registry.async_get_device_by_identifier.return_value = registry_device
+
+    with patch.object(integration.dr, "async_get", return_value=registry, create=True):
+        integration._sync_firmware_version_to_device_registry(MagicMock(), device)
+
+    registry.async_get_device_by_identifier.assert_called_once_with(
+        ("fluvalble", "AA:BB:CC:DD:EE:FF"), config_entry_id="test-entry-id"
+    )
+    registry.async_get_device.assert_not_called()
+    registry.async_update_device.assert_called_once_with("device_1", sw_version="14")
+
+
 def test_product_identity_updates_config_entry_and_device_registry():
     import custom_components.fluvalble as integration
 
     device = _make_device()
     device.product_id = 328
     device.model = "Aquasky 750mm"
-    entry = SimpleNamespace(data={"mac": device.mac})
+    entry = SimpleNamespace(entry_id="test-entry-id", data={"mac": device.mac})
     hass = MagicMock()
     registry_device = SimpleNamespace(id="device_1", model="AquaSky Bluetooth LED")
-    registry = MagicMock()
+    registry = MagicMock(spec=["async_get_device", "async_update_device"])
     registry.async_get_device.return_value = registry_device
 
     with patch.object(integration.dr, "async_get", return_value=registry, create=True):
@@ -788,4 +811,5 @@ def test_product_identity_updates_config_entry_and_device_registry():
         entry,
         data={"mac": device.mac, "product_id": 328, "model": "Aquasky 750mm"},
     )
+    registry.async_get_device.assert_called_once_with(identifiers={("fluvalble", "AA:BB:CC:DD:EE:FF")})
     registry.async_update_device.assert_called_once_with("device_1", model="Aquasky 750mm")

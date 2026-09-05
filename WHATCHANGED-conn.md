@@ -100,24 +100,33 @@ supervise) live entirely in `Device` — which explicitly passes
 means the transport layer's own default stays a no-op, and every existing
 `Client`-level test needed zero changes.
 
-**Known residual interaction, deliberately left as-is:** `_persistent()` is
-`active_time == 0 OR hold_connection` (an OR, not an override) so that
-`hold_connection`'s frozen semantics (agreed with TestsCI-3, see
-`tests/test_connection_policy.py`'s module docstring) stay exactly
-"persistent when either says so" — flipping `hold_connection` to `False`
-does not, by itself, stop the `Client`-level supervisor from self-healing a
-dropped connection for an entry whose numeric `active_time` option is
-explicitly `0`. In practice this cannot surface as "the switch didn't work":
-`Device` always drives `hold_connection` as the sole persistence knob and
-leaves the numeric option at its finite default (120s) unless a user
-deliberately sets *both* "persistent" (0) and turns the switch off — a
-self-contradictory combination. The `Device`-level `_connection_parked()`
-guard (keyed on `hold_connection` alone, see below) is what actually
-enforces "stay off until True" for every real command/read/Guardian-check
-path regardless of this Client-level nuance, so the observable contract
-("hold_connection=False refuses new connections") holds either way — only
-the *heartbeat* keeps quietly redialing in that edge case, which harms
-nothing since every consumer already refuses to use the resulting link.
+**Known gap, not fixed — flagged here instead of silently shipped:**
+`_persistent()` is `active_time == 0 OR hold_connection` (an OR, not an
+override), matching `hold_connection`'s frozen semantics agreed with
+TestsCI-3 (`tests/test_connection_policy.py`'s module docstring: "persistent
+when either says so"). For the one entry configuration where a user sets the
+numeric "Active connection window" option to exactly `0` (persistent) *and*
+turns the `hold_connection` switch off, the `Client`-level heartbeat still
+self-heals a dropped connection on its own. Once it does, `self.connected`
+becomes `True` again, and `Device._connection_parked()` — `not
+hold_connection and not self.connected` — evaluates to `False`: **commands,
+reads, and Guardian checks then proceed over that link exactly as if
+hold_connection were `True`.** This is a genuine, if narrow, contradiction of
+"False = stay off until True", not a harmless one — `_connection_parked()`
+cannot distinguish "a connection that was already legitimately up when the
+switch flipped" (which should be allowed to finish) from "a connection the
+numeric option's own persistence re-established after the switch said no"
+(which should not). `Device` never produces this combination on its own
+(it always passes the user's separately configured numeric option, default
+`120`, alongside `hold_connection`), so it requires a user to deliberately
+set both controls to contradictory values; it was not something I chose to
+special-case within this slice's frozen contract, and re-opening
+`_persistent()`'s formula now would require re-negotiating a semantic
+TestsCI-3 already tested against and signed off on. Left as a documented,
+known limitation for a future pass (e.g. having the options flow refuse
+`active_time == 0` while `hold_connection` support exists, or giving
+`_connection_parked()` its own "did *I* establish this link" bit instead of
+trusting `self.connected`) rather than silently claiming it does not exist.
 
 ### `core/device.py`
 - `hold_connection` property + setter (backed by `self._hold_connection`,

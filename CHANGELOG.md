@@ -5,6 +5,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.0.1] - 2026-09-05
+
+### Changed
+
+- **`hold_connection` now defaults to off.** This light accepts only one BLE
+  central at a time and stops advertising while connected, so a permanently
+  held Home Assistant link locked the Fluval app out indefinitely - the exact
+  failure this release fixes. By default Home Assistant now connects on
+  demand for commands and for the guardian's periodic checks, and
+  disconnects again after the active connection window, leaving the single
+  BLE slot free between checks. The **Bluetooth connection** switch and the
+  `hold_connection` option still let you ask for a permanently held link
+  (for the lowest possible command latency) when you want one.
+- The Guardian status sensor now reports `unknown` (not `ok`) before its
+  first check completes; `ok` is only ever reported by a completed
+  successful check.
+
+### Fixed
+
+- The Schedule Guardian no longer pauses supervision just because
+  `hold_connection` is off. Turning the connection switch off previously
+  made every guardian check report `paused` without even attempting BLE
+  traffic - silently disabling supervision the instant anyone used the
+  switch as documented. The guardian now only reports `paused` when
+  `expected_mode` is explicitly set to Unsupervised; an off `hold_connection`
+  still gets a real, on-demand check.
+- Stopped calling the deprecated `device_registry.async_get_device()` (Home
+  Assistant Core 2026.8+ logs a warning for it); use the config-entry-scoped
+  `async_get_device_by_identifier()` when the running Home Assistant
+  provides it, falling back to the legacy call on older, still-supported
+  versions.
+
+---
+
 ## [1.0.0] - 2026-09-05
 
 ### Added

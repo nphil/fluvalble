@@ -49,7 +49,7 @@
         },
         "data_description": {
           "lamp_profile": "Override auto-detection when the wrong model or channel count is shown. Plant and Marine/Reef use their distinct five-channel spectral layouts.",
-          "hold_connection": "Keep Home Assistant's BLE connection to the fixture open and reconnect automatically. Turn off to release the connection for the Fluval app or another controller - same effect as the Bluetooth connection switch.",
+          "hold_connection": "Keep Home Assistant's BLE connection to the fixture open permanently and reconnect automatically, for the lowest possible command latency. Off (the default) connects on demand instead - for commands and for the guardian's periodic checks - and disconnects again after the active connection window; this fixture only accepts one BLE controller at a time, so leaving this off keeps the connection free for the Fluval app between checks. Same effect as the Bluetooth connection switch.",
           "ping_interval": "How often Home Assistant reads from the light to keep the BLE connection alive. Lower values improve reliability at the cost of slightly more radio traffic. Default: 10 s.",
           "active_time": "How long to maintain the BLE connection after the last command. Use 0 for a persistent connection with the lowest command latency, or 30–600 seconds to disconnect when idle. Persistent connections consume a Bluetooth connection slot and can prevent the Fluval app or gateway from connecting. Default: 120 s.",
           "expected_mode": "The mode the guardian keeps the fixture in. Auto/Professional enforce the matching onboard schedule and clock; Manual keeps the fixture in Manual mode; Unsupervised reports status only and never writes to the fixture. Default: Auto.",
@@ -127,6 +127,7 @@
       "guardian_status": {
         "name": "Guardian status",
         "state": {
+          "unknown": "Unknown",
           "ok": "OK",
           "corrected": "Corrected",
           "failed": "Failed",

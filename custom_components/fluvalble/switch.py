@@ -76,12 +76,16 @@ class FluvalDaylightSavingSwitch(FluvalEntity, SwitchEntity):
 
 
 class FluvalBluetoothConnectionSwitch(FluvalEntity, SwitchEntity):
-    """Hold or release Home Assistant's single BLE connection slot.
+    """Hold Home Assistant's single BLE connection slot open permanently.
 
-    The fixture accepts exactly one BLE central. Turning this off lets go of
-    the connection immediately and keeps Home Assistant from reconnecting -
-    freeing the slot for the Fluval app or another controller. Turning it
-    back on resumes normal reconnect behaviour. Always available (it must be
+    The fixture accepts exactly one BLE central. On (True) keeps the GATT
+    link held open and reconnects automatically, for the lowest possible
+    command latency, at the cost of the FluvalConnect app (or another
+    controller) being locked out until it's turned back off. Off (the
+    default) is connect-on-demand, not "disconnected forever": commands and
+    the Schedule Guardian's periodic checks still connect whenever they need
+    to, then disconnect again after the active connection window, leaving
+    the slot free for the app between checks. Always available (it must be
     usable even while the fixture itself is unreachable), and not gated on
     the guardian - it directly maps to Device.hold_connection.
     """
@@ -96,13 +100,13 @@ class FluvalBluetoothConnectionSwitch(FluvalEntity, SwitchEntity):
             self._async_write_ha_state()
 
     async def async_turn_on(self, **kwargs) -> None:
-        """Hold the BLE connection open and allow reconnects."""
+        """Hold the BLE connection open permanently and allow reconnects."""
         del kwargs
         self.device.hold_connection = True
         self.internal_update()
 
     async def async_turn_off(self, **kwargs) -> None:
-        """Disconnect now and stay off until turned back on."""
+        """Release a held connection; switch to connect-on-demand."""
         del kwargs
         self.device.hold_connection = False
         self.internal_update()

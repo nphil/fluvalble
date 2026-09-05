@@ -91,7 +91,7 @@ def test_guardian_status_sensor_reflects_enum_state_and_options():
     entity = sensor.FluvalGuardianStatusSensor(device, "guardian_status", guardian)
 
     assert entity._attr_device_class == SensorDeviceClass.ENUM
-    assert set(entity._attr_options) == {"ok", "corrected", "failed", "unreachable", "paused"}
+    assert set(entity._attr_options) == {"unknown", "ok", "corrected", "failed", "unreachable", "paused"}
     assert entity._attr_native_value == "corrected"
 
 

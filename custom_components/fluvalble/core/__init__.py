@@ -11,7 +11,7 @@ CONF_HOLD_CONNECTION = "hold_connection"
 DEFAULT_PING_INTERVAL = 10  # seconds between keep-alive reads
 DEFAULT_ACTIVE_TIME = 120  # seconds to stay connected after last command
 DEFAULT_LAMP_PROFILE = "auto"
-DEFAULT_HOLD_CONNECTION = True  # keep the BLE link open and self-heal, vs. connect-on-demand
+DEFAULT_HOLD_CONNECTION = False  # connect-on-demand by default; True holds the link open persistently
 
 # Lamp profile options (options flow + channel layout)
 LAMP_PROFILE_AUTO = "auto"

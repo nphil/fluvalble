@@ -267,16 +267,20 @@ class Device:
         """Return whether Home Assistant should hold the BLE connection open.
 
         True keeps the GATT link up and reconnects on advertisement/backoff,
-        which is what lets the Guardian supervise the fixture continuously.
-        False disconnects immediately and refuses every new BLE connection
-        (including for commands) until set back to True, freeing the single
-        GATT slot for the FluvalConnect app.
+        which is what lets the Guardian supervise the fixture continuously
+        with the lowest possible command latency. False (the default) is
+        connect-on-demand, not "parked": commands, clock syncs, and Guardian
+        checks still connect whenever they need to, and the client disconnects
+        again after `active_time` of inactivity. This light exposes only one
+        BLE central at a time, so holding the link permanently locks the
+        FluvalConnect app out - `False` trades a little latency on the next
+        command for leaving the single GATT slot free between checks.
         """
         return self._hold_connection
 
     @hold_connection.setter
     def hold_connection(self, value: bool) -> None:
-        """Resume (True) or park (False) the BLE connection supervisor."""
+        """Switch between a permanently held link (True) and on-demand (False)."""
         value = bool(value)
         changed = value != self._hold_connection
         self._hold_connection = value
@@ -285,10 +289,6 @@ class Device:
         if changed:
             for handler in self.updates_connect:
                 handler()
-
-    def _connection_parked(self) -> bool:
-        """Return whether HA must not initiate a new BLE connection right now."""
-        return not self._hold_connection and not self.connected
 
     def register_connection_listener(self, listener: Callable[[bool], None]) -> Callable[[], None]:
         """Subscribe to GATT connect/disconnect transitions.
@@ -423,6 +423,13 @@ class Device:
         )
 
         if self.client is None:
+            # Constructing a Client immediately spawns a real connect attempt
+            # (see Client.__init__), so only do that eagerly here when
+            # hold_connection asks for a permanently held link. When it is
+            # False (the default), the client is created on demand instead -
+            # by the first guardian check or command that actually needs one
+            # (`_async_ensure_client()`) - so an idle install never grabs the
+            # single GATT slot on its own.
             if self._hold_connection:
                 self.client = self._new_client(device)
         else:
@@ -2016,7 +2023,7 @@ class Device:
         Returns the freshly confirmed mode string (which may differ from
         `mode` if the fixture did not take the write) or None if the write
         or its confirmation could not be completed at all (unreachable, or
-        the connection is currently parked via `hold_connection = False`).
+        the on-demand connect itself failed).
         Raises ValueError for a `mode` outside MODES - that is a programming
         error, not a runtime BLE failure.
         """
@@ -2057,13 +2064,6 @@ class Device:
         async with self._clock_sync_lock:
             if self._clock_synced and not force:
                 return True
-
-            if self._connection_parked():
-                self._set_diagnostic_error(
-                    "connection_held",
-                    "Bluetooth connection is held for the companion app; enable hold connection to sync the clock",
-                )
-                return False
 
             if self.client is None:
                 if not await self._async_ensure_client():
@@ -2153,12 +2153,6 @@ class Device:
 
     async def _async_prepare_command(self) -> bool:
         """Resolve the BLE device and connect far enough to know the protocol."""
-        if self._connection_parked():
-            self._set_diagnostic_error(
-                "connection_held",
-                "Bluetooth connection is held for the companion app; enable hold connection to send commands",
-            )
-            return False
         if not await self._async_ensure_client() or self.client is None:
             self._set_diagnostic_error("device_not_found", "BLE device is not available")
             return False
@@ -2325,11 +2319,16 @@ class Device:
     async def async_read_state(self) -> FluvalState | None:
         """Read and return a confirmed snapshot of the fixture's on-device state.
 
-        Talks to `self.client` directly (not `_async_ensure_client`/
-        `async_refresh_state`) so this also works the moment a client object
-        exists, reusing Client's own device_provider-based route refresh.
+        Bypasses `async_refresh_state`'s HA-bluetooth-component device lookup
+        once a client already exists, reusing Client's own device_provider-
+        based route refresh directly. The very first call (no client yet -
+        connect-on-demand, `hold_connection` False) goes through
+        `_async_ensure_client()` once to create one; every call after that
+        talks to `self.client` directly.
         """
-        if self._connection_parked() or self.client is None:
+        if self.client is None and not await self._async_ensure_client():
+            return None
+        if self.client is None:
             return None
         try:
             await self.client.request_state()
@@ -2445,11 +2444,14 @@ class Device:
         )
 
     async def _async_ensure_client(self) -> bool:
-        """Create or refresh a client using HA's best connectable BLE route."""
-        if not self.address:
-            return False
+        """Create or refresh a client using HA's best connectable BLE route.
 
-        if self._connection_parked():
+        Always allowed to connect - `hold_connection = False` no longer means
+        "refuse every connection"; it only governs whether the resulting
+        session is kept open indefinitely once established (see
+        `Client._persistent()`).
+        """
+        if not self.address:
             return False
 
         device = await self._async_find_device()

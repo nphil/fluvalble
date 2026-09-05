@@ -136,6 +136,13 @@ window releases the Bluetooth connection when idle so the official Fluval app
 or a Fluval gateway can connect. The backward-compatible default is `120`
 seconds.
 
+**Hold Bluetooth connection** (off by default) asks Home Assistant to keep
+the GATT link open permanently and reconnect automatically, instead of
+connecting on demand for commands and for the guardian's periodic checks and
+disconnecting again after the active connection window. Same control as the
+**Bluetooth connection** switch - see
+[Schedule Guardian & connection sharing](#schedule-guardian--connection-sharing).
+
 Some newer fixtures, including Plant PRO and Plant 4.0, permit only one
 Bluetooth controller at a time. Persistent mode therefore prevents the official
 app or gateway from connecting while Home Assistant holds the connection, and
@@ -210,12 +217,17 @@ problem turns on and Home Assistant opens a repair notification. Call
 `fluvalble.guardian_check_now` to force an immediate check outside the normal
 interval.
 
-**Sharing the connection deliberately.** The new **Bluetooth connection**
-switch lets you release Home Assistant's hold on the fixture on demand (for
-example, to make a change from the Fluval app) without removing the
-integration. Turning it off disconnects immediately and keeps Home Assistant
-from reconnecting until it's turned back on; the guardian pauses its checks
-while it's off and reports that clearly rather than treating it as a fault.
+**Sharing the connection deliberately.** Home Assistant connects **on
+demand** by default (v1.0.1+): for commands and for the guardian's periodic
+checks, then disconnects again after the active connection window, leaving
+the fixture's single BLE slot free for the Fluval app the rest of the time.
+The **Bluetooth connection** switch (or the `hold_connection` option) lets
+you ask Home Assistant to hold that connection open permanently instead, for
+the lowest possible command latency, at the cost of locking out the app (or
+any other controller) until it's turned back off. Either way, the guardian
+keeps checking and correcting on its normal schedule - only
+`expected_mode: unsupervised` pauses its corrections (it still connects for
+visibility, but never writes to the fixture).
 
 Configure `expected_mode`, `check_interval_min`, `override_return_min`, and
 `alert_after_failures` from the integration's **Configure** dialog. Set
@@ -235,7 +247,7 @@ After setup you'll see one device with entities like:
 | **Binary sensor** | Reachable | Fixture seen recently over BLE; raw GATT connection state remains available as an attribute. |
 | **Binary sensor** | Schedule problem | On after repeated failed guardian corrections or extended unreachability; pairs with a repair notification. |
 | **Sensors** | Signal strength / Source / Last seen | Optional Bluetooth diagnostics. Signal strength is disabled by default; Source shows the active route's friendly name. |
-| **Sensors** | Guardian status / last check / corrections | Guardian outcome (`ok`/`corrected`/`failed`/`unreachable`/`paused`), when it last ran, and a running correction count. |
+| **Sensors** | Guardian status / last check / corrections | Guardian outcome (`unknown` until the first check completes, then `ok`/`corrected`/`failed`/`unreachable`/`paused`), when it last ran, and a running correction count. |
 | **Button** | Sync Clock | Synchronizes the fixture's real-time clock with Home Assistant. |
 | **Button** | Return to schedule | Ends an active manual override immediately instead of waiting for the return timer. |
 | **Switch** | Daylight saving time | Onboard setting available on supported AquaSky 3.0 fixtures. |

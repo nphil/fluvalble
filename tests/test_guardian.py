@@ -127,12 +127,53 @@ def test_constructor_defaults_match_the_documented_options():
     assert guardian.problem is False
     assert guardian.override_active is False
     assert guardian.override_until is None
+    assert guardian.status == "unknown"
     assert guardian.last_check_at is None
 
 
 # ---------------------------------------------------------------------------
 # Basic ok / no-op paths
 # ---------------------------------------------------------------------------
+
+def test_status_transitions_from_unknown_to_ok_after_the_first_check():
+    device = _FakeDevice(mode="automatic")
+    guardian = ScheduleGuardian(device, expected_mode="auto")
+    assert guardian.status == "unknown"
+
+    outcome = _run(guardian.async_check())
+
+    assert outcome == "ok"
+    assert guardian.status == "ok"
+
+
+def test_status_transitions_from_unknown_to_paused_for_unsupervised_after_first_check():
+    device = _FakeDevice(mode="manual")
+    guardian = ScheduleGuardian(device, expected_mode="unsupervised")
+    assert guardian.status == "unknown"
+
+    outcome = _run(guardian.async_check())
+
+    assert outcome == "paused"
+    assert guardian.status == "paused"
+
+
+def test_guardian_check_is_unaffected_by_hold_connection_being_false():
+    """v1.0.1: hold_connection no longer gates the guardian - only
+    expected_mode == "unsupervised" does. A device reporting connect-on-
+    demand hold_connection=False (the new default) must still get a real
+    check, not a silent "paused" - the guardian's own connect-on-demand
+    calls (async_sync_clock/async_read_state) are how supervision keeps
+    working without a permanently held link."""
+    device = _FakeDevice(mode="automatic")
+    device.hold_connection = False
+    guardian = ScheduleGuardian(device, expected_mode="auto")
+
+    outcome = _run(guardian.async_check())
+
+    assert outcome == "ok"
+    assert guardian.status == "ok"
+    assert device.sync_clock_calls == 1
+    assert device.read_state_calls == 1
 
 
 def test_check_returns_ok_when_mode_already_matches_and_no_schedule_configured():

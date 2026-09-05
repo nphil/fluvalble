@@ -48,12 +48,20 @@ from . import (
 
 _LOGGER = logging.getLogger(__name__)
 
+STATUS_UNKNOWN = "unknown"
 STATUS_OK = "ok"
 STATUS_CORRECTED = "corrected"
 STATUS_FAILED = "failed"
 STATUS_UNREACHABLE = "unreachable"
 STATUS_PAUSED = "paused"
-GUARDIAN_STATUSES = [STATUS_OK, STATUS_CORRECTED, STATUS_FAILED, STATUS_UNREACHABLE, STATUS_PAUSED]
+GUARDIAN_STATUSES = [
+    STATUS_UNKNOWN,
+    STATUS_OK,
+    STATUS_CORRECTED,
+    STATUS_FAILED,
+    STATUS_UNREACHABLE,
+    STATUS_PAUSED,
+]
 
 # Guardian expected_mode option values that are actively enforced on the
 # fixture, mapped to the Device/MODES vocabulary ("manual"/"automatic"/
@@ -130,7 +138,11 @@ class ScheduleGuardian:
         self.expected_schedule = expected_schedule
         self._now = now_fn
 
-        self.status: str = STATUS_PAUSED if expected_mode == EXPECTED_MODE_UNSUPERVISED else STATUS_OK
+        # Never "ok" before a check has actually run - "ok" is a completed-
+        # check outcome, not a resting default. This also applies to
+        # expected_mode=="unsupervised": it still reports "unknown" until its
+        # first check completes and reports "paused".
+        self.status: str = STATUS_UNKNOWN
         self.last_check_at: float | None = None
         self.corrections: int = 0
         self.consecutive_failures: int = 0
@@ -182,12 +194,6 @@ class ScheduleGuardian:
     async def _async_check_locked(self) -> str:
         """Sync clock, read state, correct mode/schedule drift, report outcome."""
         self.last_check_at = self._now()
-
-        if not getattr(self.device, "hold_connection", True):
-            # The connection switch is deliberately off - stay off and don't
-            # even attempt BLE traffic. This is an intentional pause, not a
-            # comms failure, so it must never be confused with "unreachable".
-            return self._finish(STATUS_PAUSED)
 
         try:
             await self.device.async_sync_clock()
