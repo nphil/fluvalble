@@ -5,6 +5,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.2.0]
+
+### Added
+- Diagnostic sensor `sensor.<device>_connection` (enabled by default) reporting the ESPHome proxy or adapter name currently carrying the fixture's GATT link, or `disconnected`, with `hold`, `drops_1h`, `last_drop` and `reconnect_attempt` attributes. The proxy name is pushed live from habluetooth's slot allocations, so a reconnect that roams to another proxy shows up immediately.
+
+### Changed
+- `active_time` defaults to `0` (hold the link permanently) instead of `120` s. The option and its validation (0, or 30-600) are unchanged, so a finite idle window restores the previous behaviour.
+- User-initiated commands (light, mode select, buttons, schedule services) now take the device command lock ahead of guardian work, and the guardian defers its check - new `deferred` guardian status, retried 20 s later - instead of making a button press queue behind a multi-step supervision cycle. A user command's overall deadline is 15 s; native schedule writes keep the 90 s ceiling their settle-and-verify sequence needs.
+
+### Fixed
+- A queued user command could burn its full 60 s deadline waiting behind a wedged guardian clock sync and fail while the radio was answering in ~200 ms.
+- `last_seen` froze while a link was held, because only advertisements fed it and a connected fixture advertises rarely. Every successful GATT exchange (heartbeat read, state read, write, notification) now counts as activity, so nothing derived from `last_seen` goes stale on a healthy held link.
+- Reconnects after an unexpected drop back off 1, 2, 5, 10, 30, 60 s (capped, +-20 % jitter) instead of retrying every second, log the proxy that took the link at INFO, and warn once per 10 consecutive failures.
+
 ## [1.1.3]
 
 ### Fixed

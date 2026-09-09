@@ -26,7 +26,7 @@ remains documented here:
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -438,3 +438,138 @@ async def _async_test_async_read_state_reports_connection_attempts_and_scanner_s
     assert state.connection_attempts == 4
     assert state.scanner_source == "AA:BB:CC:DD:EE:FF"
     assert isinstance(state.last_state_at, float)
+
+
+# ---------------------------------------------------------------------------
+# Held link: liveness, drop accounting, and the route the Connection sensor
+# reports. Live, `last_seen` froze the moment the hold began because only
+# advertisements fed it - a held fixture advertises rarely.
+# ---------------------------------------------------------------------------
+
+
+def test_gatt_activity_keeps_last_seen_current_while_the_link_is_held():
+    _run(_async_test_gatt_activity_keeps_last_seen_current_while_the_link_is_held())
+
+
+async def _async_test_gatt_activity_keeps_last_seen_current_while_the_link_is_held():
+    from datetime import UTC, datetime, timedelta
+
+    from custom_components.fluvalble.core.client import Client
+    from custom_components.fluvalble.core.device import REACHABLE_SECONDS
+
+    device = _make_device()
+    device.set_connected(True)
+    stale = datetime.now(UTC) - timedelta(seconds=REACHABLE_SECONDS * 2)
+    device.conn_info["last_seen"] = stale
+    assert device.is_reachable() is True  # connected short-circuits...
+
+    device.connected = False
+    assert device.is_reachable() is False  # ...but nothing else kept it alive
+
+    device.set_connected(True)
+    device.conn_info["last_seen"] = stale
+
+    ble_device = _ble_device()
+    with patch("asyncio.create_task", side_effect=lambda coro: coro.close()):
+        client = Client(
+            ble_device,
+            device.set_connected,
+            activity_callback=device._on_client_activity,
+            hold_stats=device.hold_stats,
+        )
+
+    async def _heartbeat_read():
+        return b"\x00"
+
+    await client._bounded(_heartbeat_read(), 1.0, "heartbeat wake read")
+
+    assert device.conn_info["last_seen"] > stale
+    device.connected = False
+    assert device.is_reachable() is True
+
+
+def _holding_device(active_time=0):
+    """A Device built with a real `active_time` (not a config_data key)."""
+    return Device(
+        "AquaSky2.0_Test",
+        config_data={"mac": "44:A6:E5:70:F1:8D", "model": "AquaSky 2.0 Bluetooth LED", "product_id": 328},
+        active_time=active_time,
+    )
+
+
+def test_hold_attributes_track_drops_and_reconnect_progress():
+    device = _holding_device()
+    attributes = device.connection_hold_attributes()
+
+    assert attributes == {"hold": True, "drops_1h": 0, "last_drop": None, "reconnect_attempt": 0}
+
+    device.hold_stats.record_drop()
+    device.hold_stats.record_reconnect_attempt(3)
+    attributes = device.connection_hold_attributes()
+
+    assert attributes["drops_1h"] == 1
+    assert attributes["last_drop"].endswith("+00:00")
+    assert attributes["reconnect_attempt"] == 3
+
+    # A reconnect that lands clears the attempt counter but keeps the history.
+    device.set_connected(True)
+    attributes = device.connection_hold_attributes()
+    assert attributes["reconnect_attempt"] == 0
+    assert attributes["drops_1h"] == 1
+
+    assert _holding_device(active_time=120).connection_hold_attributes()["hold"] is False
+
+
+def test_hold_statistics_survive_a_connection_reset():
+    _run(_async_test_hold_statistics_survive_a_connection_reset())
+
+
+async def _async_test_hold_statistics_survive_a_connection_reset():
+    """`async_reset_connection` throws the Client away; `drops_1h` must not
+    reset to zero just because a fresh client object replaced it."""
+    device = _holding_device()
+    device.hold_stats.record_drop()
+    device.client = AsyncMock()
+
+    await device.async_reset_connection()
+
+    assert device.client is None
+    assert device.connection_hold_attributes()["drops_1h"] == 1
+
+
+def test_connection_state_names_the_proxy_holding_the_slot():
+    from custom_components.fluvalble.core.device import allocation_source_for_address
+
+    device = _make_device()
+    device.hass = MagicMock()
+    allocations = [
+        SimpleNamespace(source="AA:00:00:00:00:01", slots=3, free=3, allocated=[]),
+        SimpleNamespace(source="AA:00:00:00:00:02", slots=3, free=2, allocated=["44:A6:E5:70:F1:8D"]),
+    ]
+
+    source = allocation_source_for_address(allocations, device.address)
+    assert source == "AA:00:00:00:00:02"
+    assert allocation_source_for_address(allocations, "11:22:33:44:55:66") is None
+    assert allocation_source_for_address(None, device.address) is None
+
+    scanner = SimpleNamespace(name="plant-room-bluetooth-proxy (AA:00:00:00:00:02)", details=None)
+    with patch(
+        "custom_components.fluvalble.core.device.bluetooth.async_scanner_by_source",
+        return_value=scanner,
+    ):
+        device.connected = True
+        assert device.connection_state(source) == "plant-room-bluetooth-proxy"
+        device.connected = False
+        assert device.connection_state(source) == "disconnected"
+
+
+def test_connection_state_falls_back_to_the_recorded_route_then_to_connected():
+    device = _make_device()
+    device.connected = True
+    device.conn_info["active_connection_source"] = "office-bluetooth-proxy"
+
+    # No allocation for this address (a local adapter keeps no slot accounting).
+    assert device.connection_state(None) == "office-bluetooth-proxy"
+
+    device.conn_info.pop("active_connection_source")
+    assert device.connection_state(None) == "connected"

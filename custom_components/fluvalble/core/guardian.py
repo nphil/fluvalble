@@ -13,7 +13,8 @@ raises a Home Assistant repair when it cannot.
 constructed with a device object exposing a small async duck-typed
 interface (``async_sync_clock``, ``async_read_state``, ``async_ensure_mode``,
 ``async_set_native_auto_schedule``, ``async_set_native_pro_schedule``,
-``async_reset_connection``) and records outcomes as plain attributes.
+``async_reset_connection``, plus the ``priority_waiting`` counter it reads
+to stand aside for user commands) and records outcomes as plain attributes.
 Nothing here imports or requires a running Home Assistant core, which makes
 the whole decision engine testable with a fake device and a fake clock.
 ``start_runner`` / ``async_setup_guardian`` are the thin Home
@@ -32,7 +33,7 @@ import time
 from typing import Any
 
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import async_call_later, async_track_time_interval
 
 from . import (
     CONF_ALERT_AFTER_FAILURES,
@@ -56,6 +57,11 @@ STATUS_CORRECTED = "corrected"
 STATUS_FAILED = "failed"
 STATUS_UNREACHABLE = "unreachable"
 STATUS_PAUSED = "paused"
+# One check stood aside because a user-initiated command was queued or
+# running on the same device (`Device.priority_waiting`). Not a failure and
+# not a success: the check simply did not happen, and the runner re-arms it
+# `DEFERRED_RETRY_SECONDS` later instead of waiting a whole interval.
+STATUS_DEFERRED = "deferred"
 # Derived, never stored on `self.status` directly - see `effective_status`.
 STATUS_STALE = "stale"
 GUARDIAN_STATUSES = [
@@ -65,6 +71,7 @@ GUARDIAN_STATUSES = [
     STATUS_FAILED,
     STATUS_UNREACHABLE,
     STATUS_PAUSED,
+    STATUS_DEFERRED,
     STATUS_STALE,
 ]
 
@@ -94,6 +101,10 @@ CHECK_SCHEDULE_REPUSH_TIMEOUT = 60.0
 # steps it runs - belt-and-suspenders against any future step that forgets
 # its own bound.
 CHECK_OVERALL_TIMEOUT = 120.0
+# How soon a deferred check is retried. Long enough for a user's command
+# (0.4-2s on a held link) plus a follow-up press to finish, short enough
+# that supervision is not actually skipped.
+DEFERRED_RETRY_SECONDS = 20
 
 
 def issue_id_for_mac(mac: str) -> str:
@@ -270,9 +281,40 @@ class ScheduleGuardian:
                 await self._async_reset_connection_quiet()
                 return self._finish(STATUS_UNREACHABLE)
 
+    def _priority_pending(self) -> bool:
+        """Return whether a user-initiated command wants the device right now.
+
+        `Device.priority_waiting` counts every user command queued for or
+        holding the device's command lock. `getattr` with a default keeps
+        this engine working against any device double that predates the
+        counter.
+        """
+        return bool(getattr(self.device, "priority_waiting", 0))
+
+    def _deferred(self) -> str:
+        """Report a check that stood aside for a user-initiated command."""
+        _LOGGER.debug(
+            "Fluval guardian check for %s deferred: user command pending",
+            getattr(self.device, "mac", "?"),
+        )
+        return self._finish(STATUS_DEFERRED)
+
     async def _async_check_locked(self) -> str:
-        """Sync clock, read state, correct mode/schedule drift, report outcome."""
+        """Sync clock, read state, correct mode/schedule drift, report outcome.
+
+        Checked for a pending user command before every step that talks to
+        the fixture. A check is several separately-locked device commands,
+        and live one of them (a clock sync) wedged for 30s with a button
+        press queued behind it: the press burned its whole deadline and
+        returned an error while the radio was answering in ~200ms. Standing
+        aside costs at most one supervision cycle - the runner re-arms in
+        `DEFERRED_RETRY_SECONDS` - and no correction is ever skipped
+        silently, since the outcome is reported as STATUS_DEFERRED.
+        """
         self.last_check_at = self._now()
+
+        if self._priority_pending():
+            return self._deferred()
 
         try:
             async with asyncio.timeout(CHECK_CLOCK_SYNC_TIMEOUT):
@@ -288,6 +330,9 @@ class ScheduleGuardian:
         except Exception:  # noqa: BLE001 - best effort; read_state below reports reachability
             _LOGGER.debug("Fluval guardian clock sync failed", exc_info=True)
 
+        if self._priority_pending():
+            return self._deferred()
+
         state = await self._async_read_state_quiet()
 
         if self.expected_mode == EXPECTED_MODE_UNSUPERVISED:
@@ -302,6 +347,9 @@ class ScheduleGuardian:
         if self.expected_mode != EXPECTED_MODE_MANUAL and self.expected_mode not in _SUPERVISED_DEVICE_MODE:
             _LOGGER.warning("Unknown Fluval guardian expected_mode %r; pausing supervision", self.expected_mode)
             return self._finish(STATUS_PAUSED)
+
+        if self._priority_pending():
+            return self._deferred()
 
         target_mode = _SUPERVISED_DEVICE_MODE.get(self.expected_mode)  # None means expected_mode == "manual"
         corrected = False
@@ -332,6 +380,8 @@ class ScheduleGuardian:
                 state = await self._async_read_state_quiet() or state
 
         if target_mode is not None and not failed and getattr(state, "mode", None) == target_mode:
+            if self._priority_pending():
+                return self._deferred()
             schedule_ok, schedule_attempted = await self._async_reconcile_schedule(target_mode, state)
             if schedule_attempted:
                 corrected = corrected or schedule_ok
@@ -469,6 +519,14 @@ class ScheduleGuardian:
             await self.device.async_reset_connection()
 
     def _finish(self, status: str) -> str:
+        if status == STATUS_DEFERRED:
+            # A deferred check never reached the fixture, so it must neither
+            # count as a failure nor clear an existing failure streak - a
+            # fixture that has failed three corrections is still broken
+            # while the user is pressing buttons at it.
+            self.status = status
+            self._notify()
+            return status
         if status == STATUS_FAILED:
             self.consecutive_failures += 1
             self.consecutive_unreachable = 0
@@ -496,8 +554,13 @@ class ScheduleGuardian:
         schedule-problem repair is synced by FluvalScheduleProblemBinarySensor
         (it needs a live hass reference, which Device already carries; the
         pure engine and this runner stay hass-free apart from this method).
+
+        A check that deferred to a user command is re-armed here through a
+        single one-shot timer (`DEFERRED_RETRY_SECONDS`), replaced rather
+        than stacked, and cancelled on unload.
         """
         unsubs: list[Callable[[], None]] = []
+        retry: dict[str, Callable[[], None] | None] = {"unsub": None}
 
         # ``@callback`` matters: async_track_time_interval runs a plain function
         # in an executor thread, and hass.async_create_task from a thread is
@@ -520,7 +583,24 @@ class ScheduleGuardian:
                 )
                 self._notify()
                 return
-            hass.async_create_task(self.async_check())
+            hass.async_create_task(_async_check_and_rearm())
+
+        def _cancel_retry() -> None:
+            unsub, retry["unsub"] = retry["unsub"], None
+            if unsub is not None:
+                unsub()
+
+        @callback
+        def _retry_now(*_args: Any) -> None:
+            retry["unsub"] = None
+            _run_check_soon()
+
+        async def _async_check_and_rearm() -> None:
+            if await self.async_check() != STATUS_DEFERRED:
+                _cancel_retry()
+                return
+            _cancel_retry()
+            retry["unsub"] = async_call_later(hass, DEFERRED_RETRY_SECONDS, _retry_now)
 
         unsubs.append(
             async_track_time_interval(
@@ -541,6 +621,7 @@ class ScheduleGuardian:
         _run_check_soon()
 
         def _unsub() -> None:
+            _cancel_retry()
             for unsub in unsubs:
                 unsub()
 

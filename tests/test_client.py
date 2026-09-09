@@ -937,3 +937,138 @@ async def _async_test_disconnect_timeout_is_bounded_and_swallowed():
         await asyncio.wait_for(client._safe_disconnect(), timeout=5)
 
     assert client.client is None
+
+
+# ---------------------------------------------------------------------------
+# Held-link supervision: drop accounting, reconnect backoff, and the liveness
+# signal that keeps `last_seen` honest while the fixture is connected.
+# ---------------------------------------------------------------------------
+
+
+def test_reconnect_delay_follows_the_documented_backoff_and_caps():
+    no_jitter = lambda low, high: 0.0  # noqa: E731 - one-line stub for a keyword-only hook
+
+    delays = [client_module.reconnect_delay(attempt, jitter=no_jitter) for attempt in range(1, 9)]
+
+    assert delays == [1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 60.0, 60.0]
+    # Attempt numbers below the first step must not index backwards.
+    assert client_module.reconnect_delay(0, jitter=no_jitter) == 1.0
+
+
+def test_reconnect_delay_jitter_stays_within_twenty_percent():
+    low = client_module.reconnect_delay(6, jitter=lambda a, b: a)
+    high = client_module.reconnect_delay(6, jitter=lambda a, b: b)
+
+    assert low == pytest.approx(48.0)
+    assert high == pytest.approx(72.0)
+    assert 48.0 <= client_module.reconnect_delay(6) <= 72.0
+
+
+def test_unexpected_disconnect_counts_as_a_drop_but_a_teardown_does_not():
+    client = _make_client(active_time=0)
+    client.connect_task = None
+    connected = MagicMock()
+    client.client = connected
+
+    with patch(
+        "custom_components.fluvalble.core.client.asyncio.create_task",
+        side_effect=lambda coro: _FakeTask(coro),
+    ):
+        client._on_disconnected(connected)
+
+    assert client.hold_stats.drops_in_window() == 1
+    assert client.hold_stats.last_drop_iso() is not None
+
+    # An intentional teardown clears `self.client` first, so the same
+    # callback arriving afterwards is not a drop.
+    client.client = MagicMock()
+    client._stopping = True
+    client._on_disconnected(client.client)
+
+    assert client.hold_stats.drops_in_window() == 1
+
+
+def test_drops_age_out_of_the_trailing_window():
+    now = {"value": 1_000.0}
+    stats = client_module.ConnectionHoldStats(window_seconds=3600.0, now_fn=lambda: now["value"])
+
+    stats.record_drop()
+    now["value"] += 1800
+    stats.record_drop()
+    assert stats.drops_in_window() == 2
+
+    now["value"] += 1900  # the first drop is now 3700s old
+    assert stats.drops_in_window() == 1
+    assert stats.last_drop_iso().endswith("+00:00")
+
+
+def test_reconnect_attempt_counts_failures_and_clears_once_connected():
+    asyncio.run(_async_test_reconnect_attempt_counts_failures_and_clears_once_connected())
+
+
+async def _async_test_reconnect_attempt_counts_failures_and_clears_once_connected():
+    """One failed cycle == one backoff step; the reconnect that lands clears it.
+
+    The fourth attempt succeeds, so this also covers the loop never giving
+    up on a held link: `ping_time` is infinite and only the (simulated)
+    successful session ends the loop.
+    """
+    client = _make_client(active_time=0)
+    client.connect_task = None
+    client.ping_time = float("inf")
+    client.wake_read_uuid = None
+    delays: list[int] = []
+    fresh = SimpleNamespace(is_connected=True, start_notify=AsyncMock())
+    attempts = {"count": 0}
+
+    async def flaky_ensure_client():
+        attempts["count"] += 1
+        if attempts["count"] <= 3:
+            raise BleakError("no route to the fixture")
+        client.client = fresh
+        return fresh
+
+    async def initialize_session(_client):
+        # End the loop on the successful cycle instead of heartbeating forever.
+        client._stopping = True
+        return True
+
+    client._ensure_client = flaky_ensure_client
+    client._initialize_session = initialize_session
+
+    with patch.object(client_module, "reconnect_delay", lambda attempt: delays.append(attempt) or 0):
+        await asyncio.wait_for(client._ping_loop(), timeout=5)
+
+    assert attempts["count"] == 4
+    assert delays == [1, 2, 3]  # the backoff step grows with each failure
+    assert client.hold_stats.reconnect_attempt == 0  # cleared by the connect that landed
+
+
+def test_successful_gatt_exchange_reports_liveness():
+    asyncio.run(_async_test_successful_gatt_exchange_reports_liveness())
+
+
+async def _async_test_successful_gatt_exchange_reports_liveness():
+    """A held fixture advertises rarely, so a completed read is the proof of
+    life everything derived from `last_seen` has to rely on."""
+    seen = []
+    client = _make_client(active_time=0)
+    client.activity_callback = lambda: seen.append(True)
+
+    async def _ok():
+        return b"\x01"
+
+    assert await client._bounded(_ok(), 1.0, "heartbeat wake read") == b"\x01"
+    assert seen == [True]
+
+    client.raw_facebd = False
+    client.notify_callback(MagicMock(), bytearray(b"\x00" * 4))
+    assert seen == [True, True]
+
+    async def _hangs():
+        await asyncio.sleep(3600)
+
+    with pytest.raises(client_module.BleakOperationTimeoutError):
+        await client._bounded(_hangs(), 0.02, "heartbeat wake read")
+
+    assert seen == [True, True]  # a timed-out op is not proof of anything

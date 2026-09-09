@@ -1,24 +1,48 @@
 """Sensor platform for Fluval Aquarium LED diagnostics."""
 
 from datetime import UTC, datetime
+import logging
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory, Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from . import require_entry_runtime_data
-from .core.device import Device
+from .core.device import Device, allocation_source_for_address
 from .core.entity import FluvalEntity, FluvalGuardianEntity
 from .core.guardian import GUARDIAN_STATUSES, ScheduleGuardian
 
+_LOGGER = logging.getLogger(__name__)
+
 PARALLEL_UPDATES = 0
+
+
+def bluetooth_manager():
+    """Return habluetooth's manager, or None when it is unavailable.
+
+    Imported lazily and defensively: habluetooth ships inside Home
+    Assistant's Bluetooth stack, so the unit-test environment has neither,
+    and `get_manager()` raises until that stack is set up. Losing the
+    manager only costs this sensor its proxy *name* - it still reports
+    connected/disconnected from Device state.
+    """
+    try:
+        from habluetooth import get_manager  # noqa: PLC0415
+    except ImportError:
+        return None
+    try:
+        return get_manager()
+    except Exception:  # noqa: BLE001 - no manager before bluetooth is set up
+        _LOGGER.debug("habluetooth manager is unavailable", exc_info=True)
+        return None
 
 
 def create_entities(device: Device, guardian: ScheduleGuardian | None = None) -> list:
     """Build the entity list for this platform."""
     entities: list = [FluvalSensor(device, sensor) for sensor in device.sensors()]
+    entities.append(FluvalConnectionSensor(device, "connection"))
     if guardian is not None:
         entities.extend(
             [
@@ -77,6 +101,64 @@ class FluvalSensor(FluvalEntity, SensorEntity):
             self._attr_icon = "mdi:bluetooth"
         if self.hass:
             self._async_write_ha_state()
+
+
+class FluvalConnectionSensor(FluvalEntity, SensorEntity):
+    """Names the proxy currently carrying this fixture's GATT link.
+
+    Reports the scanner/proxy *name* (e.g. `plant-room-bluetooth-proxy`)
+    while the integration holds a link through it, and the literal
+    `disconnected` otherwise - so a heal automation can restart the one
+    proxy that carries this fixture instead of one that other devices are
+    holding. Enabled by default on purpose: automations read it.
+
+    The name comes from habluetooth's slot allocations, pushed through
+    `async_register_allocation_callback` (the same source as core's
+    `bluetooth/subscribe_connection_allocations` websocket), because a
+    reconnect is re-scored across every proxy and can legitimately land
+    somewhere new. `hold`/`drops_1h`/`last_drop`/`reconnect_attempt` come
+    from the integration's own accounting: habluetooth counts connect
+    failures, never a link that dropped after connecting.
+    """
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_icon = "mdi:bluetooth-connect"
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to device updates and habluetooth allocation pushes."""
+        await super().async_added_to_hass()
+        manager = bluetooth_manager()
+        register = getattr(manager, "async_register_allocation_callback", None)
+        if register is not None:
+            # None = every scanner: an allocation change on any proxy can
+            # mean this fixture's link moved there.
+            self.async_on_remove(register(self._allocations_changed, None))
+        self.internal_update()
+
+    @callback
+    def _allocations_changed(self, *_args) -> None:
+        """Re-derive the holding proxy after habluetooth reports a change."""
+        self.internal_update()
+
+    def internal_update(self) -> None:
+        """Refresh the reported proxy name and hold diagnostics."""
+        self._attr_native_value = self.device.connection_state(self._allocation_source())
+        self._attr_extra_state_attributes = self.device.connection_hold_attributes()
+        if self.hass:
+            self._async_write_ha_state()
+
+    def _allocation_source(self) -> str | None:
+        """Return the scanner source habluetooth says holds this address."""
+        manager = bluetooth_manager()
+        current = getattr(manager, "async_current_allocations", None)
+        if current is None:
+            return None
+        try:
+            allocations = current()
+        except Exception:  # noqa: BLE001 - a diagnostic must never raise into HA
+            _LOGGER.debug("Unable to read habluetooth slot allocations", exc_info=True)
+            return None
+        return allocation_source_for_address(allocations, self.device.address)
 
 
 class FluvalGuardianStatusSensor(FluvalGuardianEntity, SensorEntity):

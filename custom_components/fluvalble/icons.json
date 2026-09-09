@@ -18,7 +18,8 @@
           "corrected": "mdi:shield-sync-outline",
           "failed": "mdi:shield-alert-outline",
           "unreachable": "mdi:shield-off-outline",
-          "paused": "mdi:shield-off-outline"
+          "paused": "mdi:shield-off-outline",
+          "deferred": "mdi:shield-sync-outline"
         }
       },
       "guardian_last_check": {

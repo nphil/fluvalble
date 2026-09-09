@@ -148,7 +148,11 @@ class FluvalLight(FluvalEntity, LightEntity):
 
     async def async_turn_on(self, **kwargs) -> None:
         """Turn on the fixture and apply an optional colour or brightness."""
-        async with self.device.command_transaction():
+        # priority=True: this is the outermost transaction for a user's
+        # service call, and the flag has to be set here - the nested device
+        # helpers below inherit it and cannot raise the priority of a
+        # transaction that already started as background work.
+        async with self.device.command_transaction(priority=True):
             await self._async_turn_on(**kwargs)
 
     async def _async_turn_on(self, **kwargs) -> None:
@@ -306,7 +310,7 @@ class FluvalLight(FluvalEntity, LightEntity):
 
     async def async_turn_off(self, **kwargs) -> None:
         """Turn off the fixture without rewriting its colour channels."""
-        async with self.device.command_transaction():
+        async with self.device.command_transaction(priority=True):
             await self._async_turn_off(**kwargs)
 
     async def _async_turn_off(self, **kwargs) -> None:

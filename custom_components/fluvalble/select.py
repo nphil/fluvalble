@@ -68,7 +68,8 @@ class FluvalSelect(FluvalEntity, SelectEntity):
             self._async_write_ha_state()
 
     async def async_select_option(self, option: str) -> None:
-        async with self.device.command_transaction():
+        # Outermost transaction for a user's service call - see FluvalLight.
+        async with self.device.command_transaction(priority=True):
             await self._async_select_option(option)
 
     async def _async_select_option(self, option: str) -> None:

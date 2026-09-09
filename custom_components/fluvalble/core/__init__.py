@@ -8,7 +8,11 @@ CONF_PING_INTERVAL = "ping_interval"
 CONF_ACTIVE_TIME = "active_time"
 CONF_LAMP_PROFILE = "lamp_profile"
 DEFAULT_PING_INTERVAL = 10  # seconds between keep-alive reads
-DEFAULT_ACTIVE_TIME = 120  # seconds to stay connected after last command
+# 0 = hold the GATT link permanently (the default: a held link answers a
+# command in ~0.4-2 s where a fresh ESPHome-proxy connect costs 2-6 s). Values
+# from 30-600 release the link after that idle window instead. Validation
+# lives in `config_flow.validate_active_time` and is unchanged.
+DEFAULT_ACTIVE_TIME = 0
 DEFAULT_LAMP_PROFILE = "auto"
 
 # Lamp profile options (options flow + channel layout)

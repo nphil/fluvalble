@@ -49,7 +49,7 @@ class FluvalSyncClockButton(FluvalEntity, ButtonEntity):
 
     async def async_press(self) -> None:
         """Force a clock sync on the connected lamp."""
-        if not await self.device.async_sync_clock(force=True):
+        if not await self.device.async_sync_clock(force=True, priority=True):
             self._raise_command_error()
         _LOGGER.info("Fluval clock synced for %s", self.device.mac)
 

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from collections.abc import Awaitable, Callable
 import contextlib
+from datetime import UTC, datetime
 import logging
+import random
 import time
 
 from bleak import BleakClient, BleakError, BleakGATTCharacteristic, BLEDevice
@@ -40,6 +43,93 @@ CHUNK_WRITE_GAP = 0.01
 CONNECT_DEADLINE = 30.0
 GATT_OP_DEADLINE = 15.0
 DISCONNECT_DEADLINE = 5.0
+
+# Reconnect pacing for a held link. `_ping_loop` owns every reconnect cycle,
+# so one failed cycle sleeps `reconnect_delay(n)` before the next attempt:
+# 1, 2, 5, 10, 30, then 60 s forever, each jittered +-20% so several fixtures
+# recovering from the same proxy restart do not retry in lockstep. A drop
+# itself still reconnects immediately - the backoff only paces *failures*.
+RECONNECT_BACKOFF = (1.0, 2.0, 5.0, 10.0, 30.0, 60.0)
+RECONNECT_BACKOFF_JITTER = 0.2
+# One WARNING per this many consecutive failures (~5 min apart at the 60 s
+# cap) instead of one per attempt: a fixture that is simply unplugged must
+# not fill the log, but a proxy that never comes back has to be visible.
+RECONNECT_WARN_EVERY = 10
+# Trailing window behind the Connection sensor's `drops_1h` attribute.
+DROP_WINDOW_SECONDS = 3600.0
+
+
+def reconnect_delay(
+    attempt: int,
+    *,
+    jitter: Callable[[float, float], float] = random.uniform,
+) -> float:
+    """Return the backoff before retrying after `attempt` consecutive failures.
+
+    `attempt` is 1-based (1 = the first failure). Anything past the end of
+    `RECONNECT_BACKOFF` stays at the 60 s cap, so a held link keeps trying
+    forever without ever spinning.
+    """
+    index = min(max(int(attempt), 1), len(RECONNECT_BACKOFF)) - 1
+    base = RECONNECT_BACKOFF[index]
+    return max(0.0, base * (1.0 + jitter(-RECONNECT_BACKOFF_JITTER, RECONNECT_BACKOFF_JITTER)))
+
+
+class ConnectionHoldStats:
+    """Rolling drop/reconnect accounting for one fixture's held GATT link.
+
+    Owned by `Device`, not by `Client`, and passed into every client it
+    builds: `Device.async_reset_connection()` throws the whole `Client`
+    away mid-stream, and the Connection sensor's `drops_1h` must not reset
+    to zero just because the integration built a fresh client object for
+    the same fixture. Pure and clock-injectable so the window arithmetic is
+    testable without sleeping.
+    """
+
+    def __init__(
+        self,
+        *,
+        window_seconds: float = DROP_WINDOW_SECONDS,
+        now_fn: Callable[[], float] = time.time,
+    ) -> None:
+        """Initialize an empty drop record."""
+        self._window_seconds = window_seconds
+        self._now = now_fn
+        self._drops: deque[float] = deque()
+        self.last_drop: float | None = None
+        self.reconnect_attempt = 0
+
+    def record_drop(self) -> None:
+        """Record one unexpected disconnect of a link we still believed live."""
+        now = self._now()
+        self._drops.append(now)
+        self.last_drop = now
+        self._prune(now)
+
+    def record_connected(self) -> None:
+        """Clear reconnect progress after a (re)connect succeeded."""
+        self.reconnect_attempt = 0
+
+    def record_reconnect_attempt(self, attempt: int) -> None:
+        """Record which consecutive reconnect attempt is now pending."""
+        self.reconnect_attempt = max(0, int(attempt))
+
+    def drops_in_window(self) -> int:
+        """Return unexpected disconnects inside the trailing window."""
+        self._prune(self._now())
+        return len(self._drops)
+
+    def last_drop_iso(self) -> str | None:
+        """Return the last unexpected disconnect as an ISO-8601 UTC string."""
+        if self.last_drop is None:
+            return None
+        return datetime.fromtimestamp(self.last_drop, tz=UTC).isoformat()
+
+    def _prune(self, now: float) -> None:
+        """Drop timestamps that have aged out of the trailing window."""
+        cutoff = now - self._window_seconds
+        while self._drops and self._drops[0] < cutoff:
+            self._drops.popleft()
 
 
 class BleakOperationTimeoutError(BleakError):
@@ -104,6 +194,8 @@ class Client:
         connection_ready_callback: ConnectionReadyCallback | None = None,
         ready_callback: Callable[[], Awaitable[None]] | None = None,
         state_ready_callback: StateReadyCallback | None = None,
+        activity_callback: Callable[[], None] | None = None,
+        hold_stats: ConnectionHoldStats | None = None,
     ) -> None:
         """Initialize the client."""
         self.device = device
@@ -113,6 +205,13 @@ class Client:
         self.connection_ready_callback = connection_ready_callback
         self.ready_callback = ready_callback
         self.state_ready_callback = state_ready_callback
+        # Called after every successful GATT exchange (connect, heartbeat
+        # read, state read, write, inbound notification). A held link
+        # advertises rarely, so this - not advertisements - is what keeps
+        # `Device.conn_info["last_seen"]` and everything derived from it
+        # honest while the fixture is answering us over GATT.
+        self.activity_callback = activity_callback
+        self.hold_stats = hold_stats if hold_stats is not None else ConnectionHoldStats()
         self._ping_interval = ping_interval
         self._active_time = active_time
         self.connection_attempts = 0
@@ -182,10 +281,15 @@ class Client:
         subclass, so it is caught by every existing `except BleakError`/
         `except (TimeoutError, BleakError)` handler in this class without
         changes - so the caller fails this one call fast instead of hanging.
+
+        A completed op is also the integration's proof of life for a held
+        link (see `activity_callback`), so success reports activity here -
+        one place that already sees every connect, read, write and notify
+        subscription in this module.
         """
         try:
             async with asyncio.timeout(timeout):
-                return await awaitable
+                result = await awaitable
         except TimeoutError as err:
             self.last_error = f"{description} timed out after {timeout:g}s"
             _LOGGER.warning(
@@ -202,6 +306,17 @@ class Client:
             raise BleakOperationTimeoutError(
                 f"Fluval BLE {description} timed out after {timeout:g}s"
             ) from err
+        self._note_activity()
+        return result
+
+    def _note_activity(self) -> None:
+        """Tell the device a GATT exchange just succeeded."""
+        if self.activity_callback is None:
+            return
+        try:
+            self.activity_callback()
+        except Exception:  # noqa: BLE001 - liveness bookkeeping must never break a command
+            _LOGGER.debug("Fluval BLE activity callback failed", exc_info=True)
 
     def _get_characteristic(self, uuid: str) -> BleakGATTCharacteristic | None:
         """Return a characteristic if present, without raising on missing UUIDs."""
@@ -423,6 +538,19 @@ class Client:
 
         self.client = None
         self._session_initialized = False
+        # Every *intentional* teardown (`_safe_disconnect`, `_ensure_client`
+        # replacing a stale client, `stop()`) clears `self.client` before it
+        # disconnects, so reaching this point means a link we still believed
+        # live went away underneath us: that is the drop the Connection
+        # sensor counts. habluetooth does not count post-connect drops as
+        # connect failures, so nothing else in the stack would.
+        if not self._stopping:
+            self.hold_stats.record_drop()
+            _LOGGER.info(
+                "Fluval BLE link to %s dropped unexpectedly (%s in the last hour); reconnecting",
+                self.device.address,
+                self.hold_stats.drops_in_window(),
+            )
         if self.status_callback:
             self.status_callback(False)
 
@@ -481,6 +609,9 @@ class Client:
 
     def notify_callback(self, sender: BleakGATTCharacteristic, data: bytearray):
         """Handle packets sent by the Fluval."""
+        # An inbound packet is the one GATT exchange that never goes through
+        # `_bounded()`, so report liveness here too.
+        self._note_activity()
         if self.raw_facebd:
             _LOGGER.debug("Got raw Fluval data: %s", to_hex(data))
             self._dispatch_update(bytes(data))
@@ -564,9 +695,19 @@ class Client:
             self.ping_future.cancel()
 
     async def _ping_loop(self):
-        """Ping the Fluval to keep connection."""
+        """Ping the Fluval to keep connection.
+
+        Also the supervisor for a held link: one cycle == one connect, one
+        heartbeat session, and (for a finite `active_time`) one idle
+        disconnect. A cycle that fails backs off through `reconnect_delay`
+        before the next attempt rather than retrying every second, and the
+        loop never gives up while the entry is loaded - `ping_time` is
+        infinite whenever `active_time == 0`.
+        """
         loop = asyncio.get_event_loop()
+        failures = 0
         while time.time() < self.ping_time and not self._stopping:
+            failed = False
             try:
                 # Reconnect only after any command using the old link has
                 # finished its failure handling. This also makes the heartbeat
@@ -575,6 +716,8 @@ class Client:
                     client = await self._ensure_client()
                 if not await self._initialize_session(client):
                     raise BleakError("Fluval BLE session initialization failed")
+                failures = 0
+                self.hold_stats.record_connected()
 
                 # heartbeat loop
                 while time.time() < self.ping_time and not self._stopping and client is self.client:
@@ -611,14 +754,35 @@ class Client:
                         continue
                     await self._safe_disconnect()
             except TimeoutError:
-                pass
+                failed = True
             except asyncio.CancelledError:
                 raise
             except BleakError as e:
+                failed = True
                 _LOGGER.debug("ping error", exc_info=e)
             except Exception as e:
+                failed = True
                 _LOGGER.warning("ping error", exc_info=e)
-            if not self._stopping and time.time() < self.ping_time:
+            if failed:
+                failures += 1
+                self.hold_stats.record_reconnect_attempt(failures)
+                if failures % RECONNECT_WARN_EVERY == 0:
+                    _LOGGER.warning(
+                        "Fluval BLE %s has failed %s consecutive reconnect attempts: %s",
+                        self.device.address,
+                        failures,
+                        self.last_error or "no further detail",
+                    )
+                delay = reconnect_delay(failures)
+                _LOGGER.debug(
+                    "Fluval BLE reconnect attempt %s for %s failed; retrying in %.1fs",
+                    failures,
+                    self.device.address,
+                    delay,
+                )
+                if not self._stopping and time.time() < self.ping_time:
+                    await asyncio.sleep(delay)
+            elif not self._stopping and time.time() < self.ping_time:
                 await asyncio.sleep(1)
 
         self.ping_task = None

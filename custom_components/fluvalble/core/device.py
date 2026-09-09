@@ -26,7 +26,7 @@ from . import (
     LAMP_PROFILE_PLANT,
     LAMP_PROFILE_PLANT_PRO,
 )
-from .client import Client
+from .client import Client, ConnectionHoldStats
 from .color import channel_percentages_to_rgb, rgb_to_channel_percentages
 from .discovery import (
     CONF_MODEL,
@@ -51,6 +51,16 @@ _LOGGER = logging.getLogger(__name__)
 # An idle GATT disconnect is expected. Treat the fixture as reachable while
 # recent advertisement, connection, or successful command activity exists.
 REACHABLE_SECONDS = 300
+
+# States of the "Connection" diagnostic sensor. Anything else it reports is
+# the *name* of the scanner (ESPHome proxy or local adapter) currently
+# carrying this fixture's GATT link, so a heal automation can restart the
+# one proxy that matters instead of every proxy.
+CONNECTION_STATE_DISCONNECTED = "disconnected"
+# Connected, but nothing named the route: habluetooth only accounts for
+# slots on remote scanners, so a local-adapter link has no allocation to
+# read and no recorded scanner name to fall back on.
+CONNECTION_STATE_CONNECTED = "connected"
 
 NUMBERS = ["channel_1", "channel_2", "channel_3", "channel_4", "channel_5"]
 # FluvalConnect exposes Manual, Auto, and Professional as one operating-mode
@@ -112,7 +122,23 @@ SCHEDULE_VERIFY_SETTLE = (0.5, 1.0, 2.0, 2.0)
 # comfortably above Client's own worst case (30s connect + 15s per GATT
 # op) so it should never fire ahead of a more specific, more informative
 # Client-level timeout.
+#
+# This one applies to *background* work only (guardian steps, internal
+# readbacks); every guardian step is already bounded tighter by the
+# guardian itself (30s), so it stays purely a backstop there.
 DEFAULT_COMMAND_DEADLINE = 60.0
+# The same ceiling for a *user-initiated* command (priority=True). A
+# command on a held link measured 0.38-1.92s live, and every write/read
+# stayed inside 200ms-1s even at -88 dBm, so 15s is generous - and it means
+# a button press that cannot get through fails (and resets the link) fast
+# instead of burning a full minute the way it did when a guardian check
+# was wedged ahead of it.
+USER_COMMAND_DEADLINE = 15.0
+# Native schedule writes keep the long ceiling for both callers: the write
+# itself settles, reads back, and retries once on a verification mismatch
+# (SCHEDULE_VERIFY_SETTLE), which no 15s window survives. The guardian's
+# drift repush is the caller this exists for.
+SCHEDULE_COMMAND_DEADLINE = 90.0
 
 
 _P = ParamSpec("_P")
@@ -122,16 +148,26 @@ _R = TypeVar("_R")
 def serialized_device_command(
     method: Callable[Concatenate["Device", _P], Awaitable[_R]] | None = None,
     *,
-    deadline: float = DEFAULT_COMMAND_DEADLINE,
+    deadline: float | None = None,
+    priority: bool = False,
 ) -> Any:
     """Run one complete device command without interleaving another.
 
     Usable bare (`@serialized_device_command`) or parameterized
-    (`@serialized_device_command(deadline=90)`) for commands that
-    legitimately need longer than `DEFAULT_COMMAND_DEADLINE` - e.g. a
+    (`@serialized_device_command(deadline=SCHEDULE_COMMAND_DEADLINE)`) for
+    commands that legitimately need longer than the default - e.g. a
     schedule write that re-reads and retries once on a verification
     mismatch. Either way, `command_transaction()` enforces the deadline;
     see its docstring for what happens when a command exceeds it.
+
+    `priority=True` marks a command as user-initiated: it jumps ahead of
+    background (guardian) work waiting for the same device lock and, unless
+    an explicit `deadline` says otherwise, is bounded by
+    `USER_COMMAND_DEADLINE` instead of `DEFAULT_COMMAND_DEADLINE`. Methods
+    the guardian *and* the user both call declare their own keyword-only
+    `priority` parameter; this wrapper reads it out of the call's kwargs so
+    one call site can override the decorator's default, and the method body
+    itself ignores it.
     """
 
     def _decorate(
@@ -139,8 +175,13 @@ def serialized_device_command(
     ) -> Callable[Concatenate["Device", _P], Awaitable[_R]]:
         @wraps(fn)
         async def wrapped(self: "Device", *args: _P.args, **kwargs: _P.kwargs) -> _R:
+            call_priority = bool(kwargs.get("priority", priority))
+            if deadline is not None:
+                call_deadline = deadline
+            else:
+                call_deadline = USER_COMMAND_DEADLINE if call_priority else DEFAULT_COMMAND_DEADLINE
             try:
-                async with self.command_transaction(deadline=deadline):
+                async with self.command_transaction(deadline=call_deadline, priority=call_priority):
                     return await fn(self, *args, **kwargs)
             except TimeoutError:
                 # `command_transaction` already logged the warning+traceback
@@ -152,7 +193,7 @@ def serialized_device_command(
                 # instead of surfacing a raw, unhandled TimeoutError.
                 self._set_diagnostic_error(
                     "command_timeout",
-                    f"Fluval BLE command timed out after {deadline:g}s and the connection was reset",
+                    f"Fluval BLE command timed out after {call_deadline:g}s and the connection was reset",
                 )
                 return cast(_R, False)
 
@@ -161,6 +202,7 @@ def serialized_device_command(
     if method is not None:
         return _decorate(method)
     return _decorate
+
 
 def _resolved_device_name(
     name: str | None,
@@ -304,6 +346,32 @@ def _pro_schedule_mismatch(
     return None
 
 
+def allocation_source_for_address(allocations: Iterable[Any] | None, address: str) -> str | None:
+    """Return the scanner source whose connection slot holds `address`.
+
+    `allocations` is habluetooth's own slot accounting
+    (`get_manager().async_current_allocations()`): one
+    `HaBluetoothSlotAllocations(source, slots, free, allocated)` per remote
+    scanner, where `allocated` lists the addresses that scanner currently
+    has connected. This is the same source Home Assistant's
+    `bluetooth/subscribe_connection_allocations` websocket reports, and the
+    only honest answer to "which proxy is carrying this link right now" -
+    habluetooth re-scores every proxy on each `establish_connection`, so a
+    reconnect can legitimately land somewhere else than the last one did.
+
+    Kept a plain function over duck-typed objects so it is testable without
+    habluetooth installed.
+    """
+    target = address.upper()
+    for allocation in allocations or ():
+        allocated = getattr(allocation, "allocated", None) or ()
+        for item in allocated:
+            if str(item).upper() == target:
+                source = getattr(allocation, "source", None)
+                return str(source) if source else None
+    return None
+
+
 class Attribute(TypedDict, total=False):
     """Attributes used by entities like binary_sensor and number."""
 
@@ -419,6 +487,17 @@ class Device:
         self._command_transaction_owner: asyncio.Task[Any] | None = None
         self._command_transaction_depth = 0
         self._command_generation = 0
+        # User-initiated commands waiting for (or holding) the transaction
+        # lock. `_priority_idle` is set exactly while that count is zero, so
+        # a background acquirer can wait on it instead of spinning, and the
+        # guardian can read `priority_waiting` between its own steps and
+        # stand aside rather than making a button press queue behind a
+        # multi-step check the way it did live.
+        self._priority_waiting = 0
+        self._priority_idle = asyncio.Event()
+        self._priority_idle.set()
+        # Survives the Client being replaced (async_reset_connection).
+        self.hold_stats = ConnectionHoldStats()
         # Preserve the exact colour HA requested while the decoded physical
         # channels still match it.  Plant RGB conversion is intentionally
         # lossy, so reconstructing RGB from those five channels would otherwise
@@ -476,9 +555,67 @@ class Device:
         """Return the HA scanner source address serving the active connection."""
         return self.conn_info.get("active_connection_source_address")
 
+    @property
+    def priority_waiting(self) -> int:
+        """Return how many user-initiated commands want the device right now.
+
+        Counts every `command_transaction(priority=True)` from the moment it
+        starts waiting for the lock until it releases it. The guardian reads
+        this between its own steps (see `ScheduleGuardian._priority_pending`)
+        and defers its check rather than making a user's button press wait
+        out a multi-step supervision cycle: live, a queued press burned its
+        whole 60s deadline behind a wedged guardian clock sync and returned
+        an error while the radio itself was answering in ~200ms.
+        """
+        return self._priority_waiting
+
+    @property
+    def hold_active(self) -> bool:
+        """Return whether this device holds its GATT link permanently."""
+        return self._active_time == 0
+
+    async def _async_acquire_command_lock(self, *, priority: bool) -> None:
+        """Take the command lock, letting user commands cut the queue.
+
+        `asyncio.Lock` is strictly FIFO, which is the wrong order here: the
+        guardian runs several separately-locked steps per check, so a user
+        command arriving mid-check could otherwise sit behind the rest of
+        them. A background acquirer therefore refuses to keep the lock
+        while `priority_waiting` is non-zero - it releases immediately,
+        which hands the lock to the priority waiter already queued on it,
+        and waits on `_priority_idle` instead of spinning.
+        """
+        if priority:
+            self._priority_waiting += 1
+            self._priority_idle.clear()
+            try:
+                await self._command_transaction_lock.acquire()
+            except BaseException:
+                self._release_priority_slot()
+                raise
+            return
+
+        while True:
+            if self._priority_waiting:
+                await self._priority_idle.wait()
+            await self._command_transaction_lock.acquire()
+            if not self._priority_waiting:
+                return
+            self._command_transaction_lock.release()
+
+    def _release_priority_slot(self) -> None:
+        """Drop one priority reservation, waking background work when empty."""
+        self._priority_waiting = max(0, self._priority_waiting - 1)
+        if not self._priority_waiting:
+            self._priority_idle.set()
+
     @contextlib.asynccontextmanager
     async def command_transaction(
-        self, *, supersede_transition: bool = True, deadline: float = DEFAULT_COMMAND_DEADLINE
+        self,
+        *,
+        supersede_transition: bool = True,
+        deadline: float | None = None,
+        priority: bool = False,
     ) -> AsyncIterator[None]:
         """Serialize a complete command while allowing nested device helpers.
 
@@ -500,7 +637,18 @@ class Device:
         task`) ride the outermost call's deadline instead of starting a new
         one, so one bounded window covers a whole public command even when
         it calls other `@serialized_device_command` helpers internally.
+
+        `priority=True` marks this as user-initiated work: it takes the lock
+        ahead of any background acquirer (see
+        `_async_acquire_command_lock`), is visible to the guardian through
+        `priority_waiting` for as long as it is queued or running, and
+        defaults to the tighter `USER_COMMAND_DEADLINE`. A nested call
+        inherits the outermost transaction's priority along with its
+        deadline - the flag on an inner helper is ignored on purpose, so an
+        entity's whole multi-step turn-on stays one priority window.
         """
+        if deadline is None:
+            deadline = USER_COMMAND_DEADLINE if priority else DEFAULT_COMMAND_DEADLINE
         task = asyncio.current_task()
         if task is not None and self._command_transaction_owner is task:
             self._command_transaction_depth += 1
@@ -510,7 +658,7 @@ class Device:
                 self._command_transaction_depth -= 1
             return
 
-        await self._command_transaction_lock.acquire()
+        await self._async_acquire_command_lock(priority=priority)
         self._command_transaction_owner = task
         self._command_transaction_depth = 1
         if supersede_transition:
@@ -531,6 +679,8 @@ class Device:
             self._command_transaction_depth = 0
             self._command_transaction_owner = None
             self._command_transaction_lock.release()
+            if priority:
+                self._release_priority_slot()
 
     async def async_reset_connection(self) -> None:
         """Discard the current Client so the next command reconnects from scratch.
@@ -561,6 +711,59 @@ class Device:
                 handler()
         if not self.connected:
             self._schedule_reachability_refresh()
+
+    def _on_client_activity(self) -> None:
+        """Record a successful GATT exchange as fixture activity.
+
+        Passed to `Client` as its `activity_callback`. A fixture we hold a
+        link to still advertises, but far more rarely - live, `last_seen`
+        froze at the moment the hold began while the fixture was answering
+        every heartbeat - so a completed read/write/notification has to
+        count as "seen" or every advertisement-derived diagnostic (and the
+        `REACHABLE_SECONDS` window behind `is_reachable`) goes stale on a
+        perfectly healthy link. Throttled notification only: the heartbeat
+        fires every `ping_interval` seconds, which must not write four
+        entity states each time.
+        """
+        self.touch_seen(notify=False)
+        self._notify_diagnostics_throttled()
+
+    def connection_state(self, allocation_source: str | None = None) -> str:
+        """Return the scanner name carrying the link, or "disconnected".
+
+        `allocation_source` is the scanner source address habluetooth
+        reports as holding this fixture's slot (see
+        `allocation_source_for_address`). It is preferred over the route
+        recorded at connect time because it is pushed live and survives a
+        reconnect landing on a different proxy; the recorded route is the
+        fallback, and `CONNECTION_STATE_CONNECTED` the last resort for a
+        link nothing can name (a local adapter keeps no slot accounting).
+        """
+        if not self.connected:
+            return CONNECTION_STATE_DISCONNECTED
+        if allocation_source:
+            name = self._source_metadata(allocation_source)["source_name"]
+            if name:
+                return name
+        recorded = self.conn_info.get("active_connection_source")
+        if isinstance(recorded, str) and recorded:
+            return recorded
+        return CONNECTION_STATE_CONNECTED
+
+    def connection_hold_attributes(self) -> dict[str, Any]:
+        """Return the Connection sensor's attributes.
+
+        `drops_1h`/`last_drop` come from the integration's own accounting
+        (`ConnectionHoldStats`), not from habluetooth: habluetooth counts
+        failures to *connect*, never a link that dropped after connecting,
+        so nothing else in the stack knows a held link went away.
+        """
+        return {
+            "hold": self.hold_active,
+            "drops_1h": self.hold_stats.drops_in_window(),
+            "last_drop": self.hold_stats.last_drop_iso(),
+            "reconnect_attempt": self.hold_stats.reconnect_attempt,
+        }
 
     def cancel_reachability_refresh(self) -> None:
         """Cancel the pending reachability expiry callback."""
@@ -699,6 +902,14 @@ class Device:
         """Snapshot the selected HA route after GATT setup succeeds."""
         source = connected_source or self._source_from_device(device)
         metadata = self._source_metadata(source)
+        # INFO, not DEBUG: which proxy took the link is the one fact needed
+        # to explain latency or to heal the right proxy, and habluetooth
+        # re-scores every route on every reconnect, so it does change.
+        _LOGGER.info(
+            "Fluval %s connected via %s",
+            self.address,
+            metadata["source_name"] or metadata["source"] or "the local Bluetooth adapter",
+        )
         self.conn_info.update(
             {
                 "active_connection_source": metadata["source_name"],
@@ -733,6 +944,7 @@ class Device:
         """Set active GATT status while tracking fixture reachability."""
         self.connected = connected
         if connected:
+            self.hold_stats.record_connected()
             self.touch_seen(notify=False)
             self.cancel_reachability_refresh()
         else:
@@ -1112,7 +1324,7 @@ class Device:
         # later device changes must replace the cached HA colour.
         return self._commanded_at is not None and monotonic() - self._commanded_at < 2.0
 
-    @serialized_device_command
+    @serialized_device_command(priority=True)
     async def async_apply_light_channels(self, values: dict[str, int]) -> bool:
         """Apply colour channels and ensure the physical fixture is powered on."""
         if not await self.async_set_channels(values):
@@ -1199,7 +1411,7 @@ class Device:
         self.values["effect"] = None
         self._effect_restore_channels = None
 
-    @serialized_device_command
+    @serialized_device_command(priority=True)
     async def async_set_effect(self, effect: str) -> bool:
         """Start one APK-native effect on a supported Fluval controller."""
         if not await self._async_prepare_command():
@@ -1266,12 +1478,13 @@ class Device:
             handler()
         return True
 
-    @serialized_device_command(deadline=90.0)
+    @serialized_device_command(deadline=SCHEDULE_COMMAND_DEADLINE)
     async def async_set_native_auto_schedule(
         self,
         schedule: dict[str, Any],
         *,
         activate: bool = True,
+        priority: bool = False,
     ) -> bool:
         """Store a protocol-native Auto schedule in the fixture, verifying the write.
 
@@ -1283,6 +1496,12 @@ class Device:
         reported success and confirmed, because the only readback check
         `Client.send_now` runs (`_expected_state_for_packet`) never covers
         FACEBD schedule keys.
+
+        `priority` is read by `serialized_device_command`, not by this body:
+        the guardian's drift repush leaves it False so a user command can
+        cut ahead, a schedule written from a service call passes True. Both
+        keep `SCHEDULE_COMMAND_DEADLINE` - the settle-and-verify sequence
+        above needs far more than a user command's usual ceiling.
         """
         sunrise = _normalized_time_ramp(schedule.get("sunrise"))
         sunset = _normalized_time_ramp(schedule.get("sunset"))
@@ -1452,14 +1671,18 @@ class Device:
             canonical.append({"minute": minute, **{f"channel_{index}": levels[index - 1] for index in range(1, 6)}})
         return sorted(canonical, key=lambda item: item["minute"])
 
-    @serialized_device_command(deadline=90.0)
+    @serialized_device_command(deadline=SCHEDULE_COMMAND_DEADLINE)
     async def async_set_native_pro_schedule(
         self,
         points: list[dict[str, Any]],
         *,
         activate: bool = True,
+        priority: bool = False,
     ) -> bool:
-        """Store a protocol-native Professional schedule in the fixture, verifying the write."""
+        """Store a protocol-native Professional schedule in the fixture, verifying the write.
+
+        See `async_set_native_auto_schedule` for what `priority` does here.
+        """
         normalized = self._canonical_pro_points(points)
         if normalized is None:
             self._set_diagnostic_error(
@@ -1567,7 +1790,7 @@ class Device:
                 return None
         return mismatch
 
-    @serialized_device_command
+    @serialized_device_command(priority=True)
     async def async_set_native_effect_schedule(self, windows: list[dict[str, Any]]) -> bool:
         """Store APK-native timed weather-effect windows in the fixture."""
         if not await self._async_prepare_command():
@@ -1634,14 +1857,14 @@ class Device:
         self._notify_diagnostics_throttled()
         return True
 
-    @serialized_device_command
+    @serialized_device_command(priority=True)
     async def async_stop_effect(self) -> bool:
         """Stop a native effect by restoring the preceding static channel mix."""
         if not self.values.get("effect"):
             return True
         return await self.async_set_channels(self._channels_after_effect(), force=True)
 
-    @serialized_device_command
+    @serialized_device_command(priority=True)
     async def async_set_master_brightness(self, level: int) -> bool:
         """Scale all supported channels to level, preserving ratios."""
         level = min(100, max(0, round(level / 10) if level > 100 else int(level)))
@@ -1726,7 +1949,7 @@ class Device:
         with contextlib.suppress(ValueError):
             target.remove(handler)
 
-    @serialized_device_command
+    @serialized_device_command(priority=True)
     async def async_set_value(self, attr: str, value: int) -> bool:
         """Set values received by entities such as numbers and switches."""
         if attr.startswith("channel_"):
@@ -1743,12 +1966,19 @@ class Device:
         step_seconds: int = TRANSITION_STEP_SECONDS,
         force: bool = False,
     ) -> bool:
-        """Set multiple channel values, optionally ramping over time."""
+        """Set multiple channel values, optionally ramping over time.
+
+        Every caller is user-initiated (the light entity, `async_set_value`,
+        the `set_channels` service), so each transaction here is a priority
+        one. A ramp takes one priority transaction *per step* rather than
+        one for the whole ramp: the sleeps between steps are exactly when a
+        guardian check should be allowed to run.
+        """
         if transition <= 0:
-            async with self.command_transaction():
+            async with self.command_transaction(priority=True):
                 return await self._async_set_channels_now(values, force=force)
 
-        async with self.command_transaction():
+        async with self.command_transaction(priority=True):
             generation = self._command_generation
             channels = self.numbers()
             targets = {
@@ -1758,7 +1988,7 @@ class Device:
 
         steps = max(1, int(transition / max(1, step_seconds)))
         for step in range(1, steps + 1):
-            async with self.command_transaction(supersede_transition=False):
+            async with self.command_transaction(supersede_transition=False, priority=True):
                 if generation != self._command_generation:
                     self.diagnostics["status"] = "transition_interrupted"
                     self._notify_diagnostics_throttled()
@@ -1879,7 +2109,7 @@ class Device:
                 handler()
         return ok
 
-    @serialized_device_command
+    @serialized_device_command(priority=True)
     async def async_preview_schedule(
         self,
         points: list[dict[str, Any]],
@@ -1897,7 +2127,7 @@ class Device:
         self.preview_task = asyncio.create_task(self._async_preview_schedule(points, duration, step_seconds))
         return True
 
-    @serialized_device_command
+    @serialized_device_command(priority=True)
     async def async_preview_native_schedule(self, minute: int, schedule_type: str) -> bool:
         """Preview one minute of a schedule already stored by the fixture."""
         if schedule_type not in {"auto", "professional"} or not 0 <= minute < DAY_MINUTES:
@@ -1967,7 +2197,7 @@ class Device:
         self._notify_diagnostics_throttled()
         return True
 
-    @serialized_device_command
+    @serialized_device_command(priority=True)
     async def async_stop_preview(self, *, restore: bool = True) -> bool:
         """Stop any running preview, optionally restoring its preceding state."""
         restored = True
@@ -2229,7 +2459,7 @@ class Device:
         minute %= DAY_MINUTES
         return f"{minute // 60:02d}:{minute % 60:02d}"
 
-    @serialized_device_command
+    @serialized_device_command(priority=True)
     async def async_set_switch(self, attr: str, value: bool) -> bool:
         """Set switch values and send the updated state to the light."""
         _LOGGER.debug("Switch %s changed to %s", attr, value)
@@ -2263,7 +2493,7 @@ class Device:
                 handler()
         return ok
 
-    @serialized_device_command
+    @serialized_device_command(priority=True)
     async def async_set_daylight_saving_time(self, enabled: bool) -> bool:
         """Set the fixture-owned FACEBD daylight-saving flag."""
         if not await self._async_prepare_command():
@@ -2303,7 +2533,7 @@ class Device:
             return None
         return [int(value) for value in presets[slot - 1]]
 
-    @serialized_device_command
+    @serialized_device_command(priority=True)
     async def async_recall_manual_preset(self, slot: int) -> bool:
         """Apply one fixture-resident classic P1-P4 preset as FluvalConnect does."""
         if isinstance(slot, bool) or not isinstance(slot, int) or not 1 <= slot <= 4:
@@ -2347,7 +2577,7 @@ class Device:
         )
         return True
 
-    @serialized_device_command
+    @serialized_device_command(priority=True)
     async def async_save_manual_preset(self, slot: int) -> bool:
         """Save the current classic channel state in fixture slot P1-P4."""
         if isinstance(slot, bool) or not isinstance(slot, int) or not 1 <= slot <= 4:
@@ -2390,7 +2620,7 @@ class Device:
         )
         return True
 
-    @serialized_device_command
+    @serialized_device_command(priority=True)
     async def async_identify(self) -> bool:
         """Ask the fixture to identify itself using FluvalConnect's Find command."""
         if not await self._async_prepare_command():
@@ -2405,7 +2635,7 @@ class Device:
             packet = protocol.old_find_packet()
         return await self._async_send_packet(packet)
 
-    @serialized_device_command
+    @serialized_device_command(priority=True)
     async def async_select_option(self, attr: str, option: str) -> bool:
         """Set select values and send the updated state to the light."""
         if attr != "mode" or option not in MODES:
@@ -2474,8 +2704,13 @@ class Device:
                 _LOGGER.warning("Fluval timezone sync failed after connect for %s", self.address)
 
     @serialized_device_command
-    async def async_sync_clock(self, *, force: bool = False) -> bool:
-        """Run the APK's clock, state-read, and timezone initialization sequence."""
+    async def async_sync_clock(self, *, force: bool = False, priority: bool = False) -> bool:
+        """Run the APK's clock, state-read, and timezone initialization sequence.
+
+        `priority` is read by `serialized_device_command`: the Sync clock
+        button passes True, the guardian's own per-check clock sync leaves
+        it False.
+        """
         if self._clock_synced and not force:
             return True
 
@@ -2716,8 +2951,12 @@ class Device:
         return {key: value for key, value in decoded.items() if key in supported_keys}
 
     @serialized_device_command
-    async def async_refresh_state(self) -> bool:
-        """Resolve the controller and request its current state."""
+    async def async_refresh_state(self, *, priority: bool = False) -> bool:
+        """Resolve the controller and request its current state.
+
+        `priority` is read by `serialized_device_command`: the schedule
+        dashboard's explicit refresh passes True, background callers do not.
+        """
         if not await self._async_ensure_client() or self.client is None:
             return False
         client = self.client
@@ -2857,6 +3096,8 @@ class Device:
             connection_ready_callback=self._record_active_connection_source,
             ready_callback=self._async_on_client_ready,
             state_ready_callback=self._async_on_client_state_ready,
+            activity_callback=self._on_client_activity,
+            hold_stats=self.hold_stats,
         )
 
     async def _async_ensure_client(self) -> bool:

@@ -130,20 +130,33 @@ disconnect, scan for, reconnect to, or send commands to the light.
 
 Open the integration's **Configure** dialog to adjust its BLE connection behavior.
 The **Active connection window** accepts `0` for a persistent connection or
-`30`–`600` seconds for an idle timeout. Persistent mode provides the lowest
-command latency and reconnects immediately after an unexpected drop. A finite
-window (the backward-compatible default, `120` seconds) releases the
-connection when idle so the official Fluval app or a Fluval gateway can
-connect - there is nothing to do in the app itself; Home Assistant simply
-lets go of the single BLE slot once the idle window elapses, and reconnects
-on demand the next time a command or a Schedule Guardian check needs the
-fixture.
+`30`–`600` seconds for an idle timeout.
+
+- **The link is held by default** (`0`): the integration connects at setup and
+  keeps the GATT link, so a command lands in ~0.4-2 s instead of paying 2-6 s
+  for a fresh ESPHome-proxy connect first.
+- **A held link occupies exactly one proxy connection slot** (each ESPHome
+  proxy has three). The `sensor.<device>_connection` diagnostic names the proxy
+  currently carrying it, so a heal automation can restart that one proxy
+  instead of one other devices are holding.
+- **User commands preempt the Schedule Guardian.** A light, mode, button or
+  schedule call takes the fixture ahead of supervision work, and the guardian
+  reports `deferred` and retries shortly rather than making you wait.
+- **Reconnects roam.** Every reconnect goes back through Home Assistant's own
+  proxy scoring (RSSI, in-flight connects, free slots), so a link that drops
+  comes back on the best proxy available - not necessarily the previous one -
+  with a 1, 2, 5, 10, 30, 60 s backoff between failed attempts.
+
+A finite window (`30`–`600` seconds) restores the previous behaviour: it
+releases the connection when idle so the official Fluval app or a Fluval
+gateway can connect - there is nothing to do in the app itself; Home Assistant
+simply lets go of the single BLE slot once the idle window elapses, and
+reconnects on demand the next time a command or a Schedule Guardian check
+needs the fixture.
 
 Some newer fixtures, including Plant PRO and Plant 4.0, permit only one
-Bluetooth controller at a time. Persistent mode therefore prevents the official
-app or gateway from connecting while Home Assistant holds the connection, and
-it also continuously occupies one local-adapter or ESPHome proxy connection
-slot.
+Bluetooth controller at a time. Holding the link therefore prevents the
+official app or gateway from connecting while Home Assistant has it.
 
 ---
 
@@ -213,14 +226,17 @@ problem turns on and Home Assistant opens a repair notification. Call
 `fluvalble.guardian_check_now` to force an immediate check outside the normal
 interval.
 
-**Sharing the connection.** Home Assistant connects **on demand** for
-commands and for the guardian's periodic checks, then disconnects again
-after the active connection window, leaving the fixture's single BLE slot
-free for the Fluval app the rest of the time - there is nothing to do in the
-app itself, the link is simply released once Home Assistant is done with
-it. The guardian keeps checking and correcting on its normal schedule
-regardless - only `expected_mode: unsupervised` pauses its corrections (it
-still connects for visibility, but never writes to the fixture).
+**Sharing the connection.** With the default held link Home Assistant keeps
+the fixture's single BLE slot for as long as the integration is loaded. Set a
+finite **Active connection window** (`30`–`600` s) to share instead: Home
+Assistant then connects **on demand** for commands and for the guardian's
+periodic checks and disconnects again once the window elapses, leaving the
+slot free for the Fluval app the rest of the time - there is nothing to do in
+the app itself, the link is simply released once Home Assistant is done with
+it. Either way the guardian keeps checking and correcting on its normal
+schedule - only `expected_mode: unsupervised` pauses its corrections (it
+still connects for visibility, but never writes to the fixture) - and a
+command you issue always takes precedence over a check in progress.
 
 Configure `expected_mode`, `check_interval_min`, `override_return_min`, and
 `alert_after_failures` from the integration's **Configure** dialog. Set
@@ -239,8 +255,9 @@ After setup you'll see one device with entities like:
 | **Button** | Identify | Runs the fixture's native FluvalConnect Find command so the physical light identifies itself. |
 | **Binary sensor** | Reachable | Fixture seen recently over BLE; raw GATT connection state remains available as an attribute. |
 | **Binary sensor** | Schedule problem | On after repeated failed guardian corrections or extended unreachability; pairs with a repair notification. |
-| **Sensors** | Signal strength / Source / Last seen | Optional Bluetooth diagnostics. Signal strength is disabled by default; Source shows the active route's friendly name. |
-| **Sensors** | Guardian status / last check / corrections | Guardian outcome (`unknown` until the first check completes, then `ok`/`corrected`/`failed`/`unreachable`/`paused`), when it last ran, and a running correction count. |
+| **Sensors** | Signal strength / Source / Last seen | Optional Bluetooth diagnostics. Signal strength is disabled by default; Source shows the active route's friendly name. Last seen counts GATT traffic, not just advertisements, so it stays current on a held link. |
+| **Sensor** | Connection | The proxy or adapter name currently carrying the GATT link, or `disconnected`. Attributes: `hold`, `drops_1h`, `last_drop`, `reconnect_attempt`. |
+| **Sensors** | Guardian status / last check / corrections | Guardian outcome (`unknown` until the first check completes, then `ok`/`corrected`/`failed`/`unreachable`/`paused`/`deferred`), when it last ran, and a running correction count. |
 | **Button** | Sync Clock | Synchronizes the fixture's real-time clock with Home Assistant. |
 | **Button** | Return to schedule | Ends an active manual override immediately instead of waiting for the return timer. |
 | **Switch** | Daylight saving time | Onboard setting available on supported AquaSky 3.0 fixtures. |

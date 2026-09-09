@@ -951,13 +951,13 @@ def _register_services(hass: HomeAssistant) -> None:
 
     async def async_set_native_auto_schedule(call: ServiceCall) -> None:
         device = get_device(call)
-        if not await device.async_set_native_auto_schedule(call.data["schedule"]):
+        if not await device.async_set_native_auto_schedule(call.data["schedule"], priority=True):
             raise HomeAssistantError(device.diagnostics.get("last_error") or "Unable to store the native Auto schedule")
         await _async_capture_expected_schedule(hass, device, "automatic")
 
     async def async_set_native_pro_schedule(call: ServiceCall) -> None:
         device = get_device(call)
-        if not await device.async_set_native_pro_schedule(call.data["points"]):
+        if not await device.async_set_native_pro_schedule(call.data["points"], priority=True):
             raise HomeAssistantError(
                 device.diagnostics.get("last_error") or "Unable to store the native Professional schedule"
             )
@@ -1265,7 +1265,8 @@ async def _async_schedule_payload(hass: HomeAssistant, entry_id: str, *, refresh
     device = _device_for_entry(hass, entry_id)
     refresh_ok = None
     if refresh:
-        refresh_ok = bool(device is not None and await device.async_refresh_state())
+        # The user pressed refresh in the schedule editor and is waiting.
+        refresh_ok = bool(device is not None and await device.async_refresh_state(priority=True))
     saved = await _async_load_schedule_data(hass, entry_id)
     effect_windows = saved.get("effect_windows")
     if (
@@ -1509,7 +1510,7 @@ async def _async_upload_native_schedule(hass: HomeAssistant, entry_id: str, poin
             }
         )
         return False
-    ok = await device.async_set_native_pro_schedule(points, activate=True)
+    ok = await device.async_set_native_pro_schedule(points, activate=True, priority=True)
     device.diagnostics["native_schedule_last_result"] = "uploaded" if ok else "failed"
     if ok:
         await _async_capture_expected_schedule(hass, device, "professional")

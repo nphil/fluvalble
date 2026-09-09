@@ -41,6 +41,9 @@ class _FakeDevice:
         hang_on_read_state=False,
         hang_on_ensure_mode=False,
         hang_on_push=False,
+        priority_waiting=0,
+        priority_waiting_after_clock_sync=None,
+        priority_waiting_after_read_state=None,
     ):
         self.mac = "AA:BB:CC:DD:EE:FF"
         self.mode = mode
@@ -61,6 +64,13 @@ class _FakeDevice:
         self.hang_on_read_state = hang_on_read_state
         self.hang_on_ensure_mode = hang_on_ensure_mode
         self.hang_on_push = hang_on_push
+        # `Device.priority_waiting`: user-initiated commands queued for or
+        # holding the device's command lock. The `*_after_*` variants make a
+        # user command "arrive" mid-check so the deferral boundary between
+        # two specific steps can be exercised.
+        self.priority_waiting = priority_waiting
+        self.priority_waiting_after_clock_sync = priority_waiting_after_clock_sync
+        self.priority_waiting_after_read_state = priority_waiting_after_read_state
 
         self.sync_clock_calls = 0
         self.read_state_calls = 0
@@ -71,6 +81,8 @@ class _FakeDevice:
 
     async def async_sync_clock(self):
         self.sync_clock_calls += 1
+        if self.priority_waiting_after_clock_sync is not None:
+            self.priority_waiting = self.priority_waiting_after_clock_sync
         return True
 
     async def async_read_state(self):
@@ -79,6 +91,8 @@ class _FakeDevice:
             await asyncio.sleep(3600)
         if not self.read_state_ok:
             raise RuntimeError("fixture unreachable")
+        if self.priority_waiting_after_read_state is not None:
+            self.priority_waiting = self.priority_waiting_after_read_state
         return SimpleNamespace(mode=self.mode, auto_schedule=self.auto_schedule, pro_schedule=self.pro_schedule)
 
     async def async_ensure_mode(self, mode):
@@ -375,6 +389,128 @@ def test_mode_and_schedule_drift_together_count_as_one_correction():
     assert device.auto_schedule_pushes == [{"sunrise": 420}]
     assert guardian.corrections == 1
 
+
+# ---------------------------------------------------------------------------
+# Deferral: supervision stands aside for a user-initiated command
+# ---------------------------------------------------------------------------
+
+
+def test_check_defers_without_touching_the_fixture_while_a_user_command_is_pending():
+    device = _FakeDevice(mode="professional", priority_waiting=1)
+    guardian = ScheduleGuardian(device, expected_mode="auto")
+
+    assert _run(guardian.async_check()) == "deferred"
+    assert guardian.status == "deferred"
+    # Not one GATT-facing step ran: the point is to hand the radio over.
+    assert device.sync_clock_calls == 0
+    assert device.read_state_calls == 0
+    assert device.ensure_mode_calls == []
+
+
+def test_check_defers_between_steps_when_a_user_command_arrives_mid_check():
+    """The live failure was a press queued behind a check already underway."""
+    device = _FakeDevice(mode="professional", priority_waiting_after_clock_sync=1)
+    guardian = ScheduleGuardian(device, expected_mode="auto")
+
+    assert _run(guardian.async_check()) == "deferred"
+    assert device.sync_clock_calls == 1
+    assert device.read_state_calls == 0
+
+
+def test_check_defers_before_correcting_drift_when_a_user_command_arrives():
+    device = _FakeDevice(mode="professional", priority_waiting_after_read_state=1)
+    guardian = ScheduleGuardian(device, expected_mode="auto")
+
+    assert _run(guardian.async_check()) == "deferred"
+    assert device.read_state_calls == 1
+    # The drift is real and still uncorrected - deferral must not write.
+    assert device.ensure_mode_calls == []
+    assert device.mode == "professional"
+
+
+def test_check_defers_before_repushing_a_drifted_schedule():
+    device = _FakeDevice(
+        mode="automatic",
+        auto_schedule={"sunrise": 480},
+        priority_waiting_after_read_state=1,
+    )
+    guardian = ScheduleGuardian(device, expected_mode="auto", expected_schedule={"sunrise": 420})
+
+    assert _run(guardian.async_check()) == "deferred"
+    assert device.auto_schedule_pushes == []
+
+
+def test_deferral_neither_counts_as_a_failure_nor_clears_a_failure_streak():
+    device = _FakeDevice(mode="professional", raise_on_ensure_mode=True)
+    guardian = ScheduleGuardian(device, expected_mode="auto", alert_after_failures=2)
+
+    assert _run(guardian.async_check()) == "failed"
+    assert _run(guardian.async_check()) == "failed"
+    assert guardian.problem is True
+
+    device.priority_waiting = 1
+    assert _run(guardian.async_check()) == "deferred"
+
+    # The fixture is still broken while the user is pressing buttons at it.
+    assert guardian.consecutive_failures == 2
+    assert guardian.problem is True
+
+
+def test_deferred_check_is_not_reported_as_stale():
+    """`last_check_at` still advances: the supervisor is alive, just polite."""
+    clock = _Clock()
+    device = _FakeDevice(mode="automatic", priority_waiting=1)
+    guardian = ScheduleGuardian(device, expected_mode="auto", check_interval_min=10, now_fn=clock)
+
+    assert _run(guardian.async_check()) == "deferred"
+    clock.advance(60)
+
+    assert guardian.effective_status == "deferred"
+
+
+def test_runner_rearms_a_deferred_check_instead_of_waiting_a_full_interval(monkeypatch):
+    _run(_async_test_runner_rearms_a_deferred_check_instead_of_waiting_a_full_interval(monkeypatch))
+
+
+async def _async_test_runner_rearms_a_deferred_check_instead_of_waiting_a_full_interval(monkeypatch):
+    from unittest.mock import MagicMock
+
+    later: list[tuple[float, object]] = []
+    cancelled: list[int] = []
+
+    def fake_call_later(hass, delay, action):
+        later.append((delay, action))
+        return lambda: cancelled.append(len(later))
+
+    monkeypatch.setattr(guardian_module, "async_track_time_interval", lambda hass, action, interval: (lambda: None))
+    monkeypatch.setattr(guardian_module, "async_call_later", fake_call_later)
+
+    device = _FakeDevice(mode="automatic", priority_waiting=1)
+    device.register_connection_listener = lambda cb: (lambda: None)
+    guardian = ScheduleGuardian(device, expected_mode="auto", check_interval_min=10)
+
+    created: list[object] = []
+    hass = MagicMock()
+    hass.async_create_task.side_effect = created.append
+    unsub = guardian.start_runner(hass)
+
+    # start_runner's initial trigger: run the coroutine it handed to hass.
+    assert len(created) == 1
+    await created[0]
+
+    assert guardian.status == "deferred"
+    assert [delay for delay, _action in later] == [guardian_module.DEFERRED_RETRY_SECONDS]
+
+    # The retry fires a fresh check; with the user command gone it completes.
+    device.priority_waiting = 0
+    later[0][1]()
+    assert len(created) == 2
+    await created[1]
+
+    assert guardian.status == "ok"
+    assert len(later) == 1  # a completed check re-arms nothing
+
+    unsub()
 
 # ---------------------------------------------------------------------------
 # Failure / exception handling never propagates

@@ -571,7 +571,9 @@ async def _async_test_native_schedule_mode_uploads_once_to_the_fixture(monkeypat
     await async_set_schedule_mode(hass, "entry_1", "native")
 
     assert _MemoryStore.data["schedules"]["entry_1"]["mode"] == "native"
-    device.async_set_native_pro_schedule.assert_awaited_once_with(_canonical_schedule_points(), activate=True)
+    device.async_set_native_pro_schedule.assert_awaited_once_with(
+        _canonical_schedule_points(), activate=True, priority=True
+    )
 
 
 def test_native_schedule_upload_rejects_more_than_twelve_points():
@@ -735,7 +737,9 @@ async def _async_test_legacy_auto_schedule_migrates_to_fixture(monkeypatch):
 
     await _async_migrate_legacy_auto_schedule(_FakeHass(device), "entry_1")
 
-    device.async_set_native_pro_schedule.assert_awaited_once_with(_canonical_schedule_points(), activate=True)
+    device.async_set_native_pro_schedule.assert_awaited_once_with(
+        _canonical_schedule_points(), activate=True, priority=True
+    )
     assert _MemoryStore.data["schedules"]["entry_1"]["mode"] == "native"
 
 

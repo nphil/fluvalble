@@ -1,6 +1,7 @@
 """Tests for Fluval device schedule and channel behavior."""
 
 import asyncio
+import contextlib
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -704,6 +705,198 @@ async def _async_test_async_reset_connection_tolerates_a_failing_stop():
     await device.async_reset_connection()
 
     assert device.client is None
+
+
+# ---------------------------------------------------------------------------
+# Priority: a user-initiated command must not wait out guardian work. Live,
+# a button press queued behind a wedged guardian clock sync burned its whole
+# 60s deadline and returned an error while the radio was answering in ~200ms.
+# ---------------------------------------------------------------------------
+
+
+def test_priority_command_runs_before_a_background_command_that_queued_first():
+    asyncio.run(_async_test_priority_command_runs_before_a_background_command_that_queued_first())
+
+
+async def _async_test_priority_command_runs_before_a_background_command_that_queued_first():
+    """The lock is FIFO, which is the wrong order for a guardian check.
+
+    A check is several separately-locked device commands in a row, so the
+    guardian's *next* step is often already queued when the user presses a
+    button. The user's command has to overtake it.
+    """
+    device = _make_device()
+    order: list[str] = []
+    holding = asyncio.Event()
+    release = asyncio.Event()
+
+    async def guardian_step_one():
+        async with device.command_transaction():
+            holding.set()
+            await release.wait()
+            order.append("guardian_step_1")
+
+    async def guardian_step_two():
+        async with device.command_transaction():
+            order.append("guardian_step_2")
+
+    async def user_command():
+        async with device.command_transaction(priority=True):
+            order.append("user")
+
+    first = asyncio.create_task(guardian_step_one())
+    await holding.wait()
+    second = asyncio.create_task(guardian_step_two())
+    await asyncio.sleep(0)  # let the background step queue on the lock first
+    third = asyncio.create_task(user_command())
+    await asyncio.sleep(0)
+
+    assert device.priority_waiting == 1
+
+    release.set()
+    await asyncio.wait_for(asyncio.gather(first, second, third), timeout=5)
+
+    assert order == ["guardian_step_1", "user", "guardian_step_2"]
+    assert device.priority_waiting == 0
+    assert not device._command_transaction_lock.locked()
+
+
+def test_nested_transactions_inherit_priority_without_leaking_a_reservation():
+    asyncio.run(_async_test_nested_transactions_inherit_priority_without_leaking_a_reservation())
+
+
+async def _async_test_nested_transactions_inherit_priority_without_leaking_a_reservation():
+    """A leaked reservation would defer every guardian check forever."""
+    device = _make_device()
+
+    async with device.command_transaction(priority=True):
+        assert device.priority_waiting == 1
+        async with device.command_transaction():
+            assert device.priority_waiting == 1
+        async with device.command_transaction(priority=True):
+            assert device.priority_waiting == 1
+
+    assert device.priority_waiting == 0
+
+    # And background work runs again immediately afterwards.
+    async with asyncio.timeout(1):
+        async with device.command_transaction():
+            pass
+
+
+def test_cancelled_priority_command_releases_its_reservation():
+    asyncio.run(_async_test_cancelled_priority_command_releases_its_reservation())
+
+
+async def _async_test_cancelled_priority_command_releases_its_reservation():
+    """An abandoned press must not park the guardian permanently."""
+    device = _make_device()
+    holding = asyncio.Event()
+    release = asyncio.Event()
+
+    async def holder():
+        async with device.command_transaction():
+            holding.set()
+            await release.wait()
+
+    async def user_command():
+        async with device.command_transaction(priority=True):
+            pass
+
+    holder_task = asyncio.create_task(holder())
+    await holding.wait()
+    user_task = asyncio.create_task(user_command())
+    await asyncio.sleep(0)
+    assert device.priority_waiting == 1
+
+    user_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await user_task
+
+    assert device.priority_waiting == 0
+    release.set()
+    await asyncio.wait_for(holder_task, timeout=5)
+
+    async with asyncio.timeout(1):
+        async with device.command_transaction():
+            pass
+
+
+def test_priority_selects_the_user_deadline_and_an_explicit_one_still_wins(monkeypatch):
+    asyncio.run(_async_test_priority_selects_the_user_deadline_and_an_explicit_one_still_wins(monkeypatch))
+
+
+async def _async_test_priority_selects_the_user_deadline_and_an_explicit_one_still_wins(monkeypatch):
+    """User commands get the short ceiling; schedule writes keep their own."""
+    import custom_components.fluvalble.core.device as device_module
+
+    monkeypatch.setattr(device_module, "USER_COMMAND_DEADLINE", 0.02)
+
+    async def _hangs_forever(_self):
+        await asyncio.sleep(3600)
+
+    device = _make_device()
+    device.client = AsyncMock()
+    user_command = device_module.serialized_device_command(_hangs_forever, priority=True)
+
+    assert await asyncio.wait_for(user_command(device), timeout=5) is False
+    assert device.diagnostics["last_error"] == (
+        "Fluval BLE command timed out after 0.02s and the connection was reset"
+    )
+    assert device.client is None
+    assert device.priority_waiting == 0
+
+    # Background work keeps the longer backstop even with the user ceiling
+    # shrunk to 20ms, and an explicit deadline (native schedule writes) is
+    # never shortened by priority.
+    device.client = AsyncMock()
+    background = device_module.serialized_device_command(_hangs_forever)
+    schedule_write = device_module.serialized_device_command(_hangs_forever, deadline=5.0, priority=True)
+    background_task = asyncio.create_task(background(device))
+    await asyncio.sleep(0.1)
+    assert not background_task.done()
+    background_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await background_task
+
+    schedule_task = asyncio.create_task(schedule_write(device))
+    await asyncio.sleep(0.1)
+    assert not schedule_task.done()
+    schedule_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await schedule_task
+
+
+def test_light_and_schedule_commands_declare_the_priority_the_guardian_reads():
+    asyncio.run(_async_test_light_and_schedule_commands_declare_the_priority_the_guardian_reads())
+
+
+async def _async_test_light_and_schedule_commands_declare_the_priority_the_guardian_reads():
+    """The counter has to rise for a real entity-facing command, not just a
+    hand-built transaction - that is what the guardian checks between steps."""
+    device = _make_device()
+    seen: list[int] = []
+
+    async def _prepare() -> bool:
+        seen.append(device.priority_waiting)
+        return False
+
+    device._async_prepare_command = _prepare
+    # async_sync_clock resolves its own client rather than going through
+    # _async_prepare_command.
+    device._async_ensure_client = _prepare
+
+    await device.async_set_switch("led_on_off", True)
+    await device.async_identify()
+    await device.async_set_native_auto_schedule(_LIVE_BUG_AUTO_SCHEDULE, priority=True)
+    await device.async_sync_clock(force=True, priority=True)
+
+    assert seen and all(count == 1 for count in seen)
+
+    seen.clear()
+    # The guardian's own calls are background work.
+    await device.async_sync_clock(force=True)
+    assert seen == [0]
 
 
 # ---------------------------------------------------------------------------

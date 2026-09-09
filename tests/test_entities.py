@@ -72,7 +72,12 @@ def test_create_entities_for_platforms():
     mode_entities = select.create_entities(device)
     assert len(mode_entities) == 1
     assert mode_entities[0].attr == "mode"
-    assert len(sensor.create_entities(device)) == 3
+    assert {entity.attr for entity in sensor.create_entities(device)} == {
+        "rssi",
+        "last_seen",
+        "active_connection_source",
+        "connection",
+    }
     assert len(button.create_entities(device)) == 2
     assert len(binary_sensor.create_entities(device)) == 1
     assert len(light.create_entities(device)) == 1
@@ -920,3 +925,106 @@ def test_product_identity_updates_config_entry_and_device_registry():
     )
     registry.async_get_device.assert_called_once_with(identifiers={("fluvalble", "AA:BB:CC:DD:EE:FF")})
     registry.async_update_device.assert_called_once_with("device_1", model="Aquasky 750mm")
+
+
+# ---------------------------------------------------------------------------
+# Connection sensor: names the proxy carrying the held link so a heal
+# automation restarts that proxy and not one other devices are holding.
+# ---------------------------------------------------------------------------
+
+
+def _allocations(address="AA:BB:CC:DD:EE:FF", source="AA:00:00:00:00:02"):
+    return [
+        SimpleNamespace(source="AA:00:00:00:00:01", slots=3, free=3, allocated=[]),
+        SimpleNamespace(source=source, slots=3, free=2, allocated=[address]),
+    ]
+
+
+def test_connection_sensor_reports_the_proxy_name_and_hold_attributes():
+    device = _make_device()
+    device.hass = MagicMock()
+    manager = SimpleNamespace(
+        async_current_allocations=lambda: _allocations(),
+        async_register_allocation_callback=lambda cb, source: (lambda: None),
+    )
+    scanner = SimpleNamespace(name="plant-room-bluetooth-proxy (AA:00:00:00:00:02)", details=None)
+
+    with (
+        patch.object(sensor, "bluetooth_manager", return_value=manager),
+        patch(
+            "custom_components.fluvalble.core.device.bluetooth.async_scanner_by_source",
+            return_value=scanner,
+        ),
+    ):
+        entity = sensor.FluvalConnectionSensor(device, "connection")
+
+    assert entity._attr_unique_id == "AABBCCDDEEFF_connection"
+    assert entity._attr_translation_key == "connection"
+    assert entity._attr_entity_category.value == "diagnostic"
+    assert entity._attr_icon == "mdi:bluetooth-connect"
+    # Automations read this sensor, so it must not ship disabled like rssi.
+    assert getattr(entity, "_attr_entity_registry_enabled_default", True) is True
+    assert entity._attr_native_value == "plant-room-bluetooth-proxy"
+    assert entity._attr_extra_state_attributes == {
+        "hold": False,
+        "drops_1h": 0,
+        "last_drop": None,
+        "reconnect_attempt": 0,
+    }
+
+
+def test_connection_sensor_reports_disconnected_and_tracks_drops():
+    device = _make_device()
+    device.connected = False
+    device.hold_stats.record_drop()
+    device.hold_stats.record_reconnect_attempt(2)
+
+    with patch.object(sensor, "bluetooth_manager", return_value=None):
+        entity = sensor.FluvalConnectionSensor(device, "connection")
+
+    assert entity._attr_native_value == "disconnected"
+    assert entity._attr_extra_state_attributes["drops_1h"] == 1
+    assert entity._attr_extra_state_attributes["reconnect_attempt"] == 2
+    assert entity._attr_extra_state_attributes["last_drop"].endswith("+00:00")
+
+
+def test_connection_sensor_updates_by_push_and_unsubscribes_on_removal():
+    asyncio.run(_async_test_connection_sensor_updates_by_push_and_unsubscribes_on_removal())
+
+
+async def _async_test_connection_sensor_updates_by_push_and_unsubscribes_on_removal():
+    """habluetooth pushes allocation changes; a link that roams to another
+    proxy has to show up without waiting for a poll."""
+    device = _make_device()
+    device.hass = MagicMock()
+    holder = {"source": "AA:00:00:00:00:02"}
+    callbacks = []
+    unsubscribed = []
+
+    def register(cb, source):
+        callbacks.append((cb, source))
+        return lambda: unsubscribed.append(True)
+
+    manager = SimpleNamespace(
+        async_current_allocations=lambda: _allocations(source=holder["source"]),
+        async_register_allocation_callback=register,
+    )
+
+    with (
+        patch.object(sensor, "bluetooth_manager", return_value=manager),
+        patch("custom_components.fluvalble.core.device.bluetooth.async_scanner_by_source", return_value=None),
+    ):
+        entity = sensor.FluvalConnectionSensor(device, "connection")
+        await entity.async_added_to_hass()
+
+        assert callbacks and callbacks[0][1] is None  # every scanner, not one
+        assert entity._attr_native_value == "AA:00:00:00:00:02"
+
+        holder["source"] = "AA:00:00:00:00:07"
+        callbacks[0][0](SimpleNamespace(source="AA:00:00:00:00:07", slots=3, free=2, allocated=[device.address]))
+
+        assert entity._attr_native_value == "AA:00:00:00:00:07"
+
+        await entity.async_will_remove_from_hass()
+
+    assert unsubscribed == [True]
