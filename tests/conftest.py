@@ -154,7 +154,12 @@ def _stub_homeassistant():
     ha_ce.ConfigFlowResult = dict  # type alias in real HA
     # Only the states this integration branches on. `is` comparisons against
     # these members are exactly what repairs.py does with the real enum.
-    ha_ce.ConfigEntryState = enum.Enum("ConfigEntryState", {"LOADED": "loaded", "NOT_LOADED": "not_loaded"})
+    # SETUP_RETRY is where a fixture that was silent at startup lives: setup
+    # never completes, so the repair ladder has to work without runtime data.
+    ha_ce.ConfigEntryState = enum.Enum(
+        "ConfigEntryState",
+        {"LOADED": "loaded", "NOT_LOADED": "not_loaded", "SETUP_RETRY": "setup_retry"},
+    )
 
     # ---- homeassistant.components.bluetooth ----
     ha_bt = types.ModuleType("homeassistant.components.bluetooth")

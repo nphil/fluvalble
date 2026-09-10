@@ -756,3 +756,65 @@ def test_issue_ids_follow_the_existing_mac_derived_convention():
 
     assert issue_id_for(device) == SCHEDULE_ISSUE
     assert recovery.unreachable_issue_id_for(device) == UNREACHABLE_ISSUE
+
+
+# ---------------------------------------------------------------------------
+# The ladder on an entry that is not loaded
+# ---------------------------------------------------------------------------
+
+
+def _unloaded_entry(*, services=None, heard=False, monkeypatch=None):
+    """Return (hass, entry) for an entry that never finished setup.
+
+    A fixture left dark long enough ends up here: no runtime data, no device,
+    no guardian - which is exactly when the operator reaches for Fix.
+    """
+    entry = _make_entry()
+    entry.state = ConfigEntryState.SETUP_RETRY
+    entry.runtime_data = None
+    hass = _FakeHass(entries=[entry], services=services)
+    if monkeypatch is not None:
+        monkeypatch.setattr(
+            repairs.bluetooth,
+            "async_last_service_info",
+            lambda hass_, address, connectable=True: object() if heard else None,
+        )
+    return hass, entry
+
+
+def test_an_unloaded_entry_still_gets_the_ladder(monkeypatch):
+    """The rungs that matter - reload, proxy, mains - all work unloaded."""
+    hass, entry = _unloaded_entry(monkeypatch=monkeypatch)
+
+    result = asyncio.run(_flow(hass, UNREACHABLE_ISSUE, entry).async_step_init())
+
+    assert result["type"] == "menu"
+    assert repairs.MENU_POWER_CYCLE in result["menu_options"]
+    assert repairs.MENU_RELOAD in result["menu_options"]
+
+
+def test_a_schedule_repair_on_an_unloaded_entry_falls_through_to_the_ladder(monkeypatch):
+    """No guardian exists to re-push through, so do not dead-end on an abort."""
+    hass, entry = _unloaded_entry(monkeypatch=monkeypatch)
+    flow = _flow(hass, SCHEDULE_ISSUE, entry)
+
+    form = asyncio.run(flow.async_step_init())
+    assert form["type"] == "form"
+
+    result = asyncio.run(flow.async_step_repush_schedule({}))
+
+    assert result["type"] == "menu"
+    assert "not loaded" in result["description_placeholders"]["last_result"]
+
+
+def test_an_unloaded_entry_that_is_heard_again_counts_as_recovered(monkeypatch):
+    """Without a device, the advertisement setup waits for is the only signal."""
+    hass, entry = _unloaded_entry(heard=True, monkeypatch=monkeypatch)
+
+    assert _flow(hass, UNREACHABLE_ISSUE, entry)._healthy() is True
+
+
+def test_an_unloaded_entry_that_is_silent_is_not_recovered(monkeypatch):
+    hass, entry = _unloaded_entry(heard=False, monkeypatch=monkeypatch)
+
+    assert _flow(hass, UNREACHABLE_ISSUE, entry)._healthy() is False

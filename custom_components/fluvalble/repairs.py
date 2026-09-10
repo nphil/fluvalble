@@ -27,6 +27,7 @@ from typing import Any
 import voluptuous as vol
 
 from homeassistant import data_entry_flow
+from homeassistant.components import bluetooth
 from homeassistant.components.repairs import RepairsFlow
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import ATTR_ENTITY_ID, CONF_MAC
@@ -102,7 +103,14 @@ class BleRecoveryFixFlow(RepairsFlow):
 
         runtime = self._runtime()
         if runtime is None:
-            return self.async_abort(reason="entry_not_loaded")
+            # The entry is not loaded (typically still retrying setup because
+            # the fixture is silent). There is no guardian to push through, but
+            # the ladder below can still reload, restart the proxy or cut mains,
+            # so fall through rather than dead-ending the operator on an abort.
+            self._last_result = (
+                "The integration is not loaded, so the schedule could not be re-pushed."
+            )
+            return await self.async_step_menu()
         guardian = runtime.guardian
         if guardian is None:
             self._last_result = "No guardian is running for this light, so its schedule could not be re-pushed."
@@ -226,13 +234,36 @@ class BleRecoveryFixFlow(RepairsFlow):
         one: `link_healthy` for the BLE link, and the guardian's own
         `problem` flag - the same flag that raised the schedule repair - for
         a schedule problem.
+
+        With no runtime data there is nothing to ask, and answering False
+        forever would make every rung fail for an entry that is not loaded -
+        the state a fixture left dark long enough ends up in. The honest
+        substitute is the signal setup itself waits for: a connectable
+        advertisement. Being heard again is not the same as a working link,
+        so it only counts while there is no runtime to give a real verdict;
+        the moment the entry loads, `link_healthy` takes over.
         """
         runtime = self._runtime()
-        if runtime is None or not link_healthy(runtime.device):
+        if runtime is None:
+            return self._advertising()
+        if not link_healthy(runtime.device):
             return False
         if self._is_schedule_issue and runtime.guardian is not None:
             return not runtime.guardian.problem
         return True
+
+    def _advertising(self) -> bool:
+        """Return whether Home Assistant currently hears this fixture."""
+        entry = self._entry()
+        if entry is None:
+            return False
+        mac = str(entry.data.get(CONF_MAC) or "").upper()
+        if not mac:
+            return False
+        try:
+            return bluetooth.async_last_service_info(self.hass, mac, connectable=True) is not None
+        except Exception:  # noqa: BLE001 - no manager before bluetooth is set up
+            return False
 
     def _async_reconcile_issue(self) -> None:
         """Let the integration's own watcher agree the repair is over.
