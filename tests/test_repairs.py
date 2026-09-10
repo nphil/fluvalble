@@ -27,6 +27,11 @@ SCHEDULE_ISSUE = "44A6E570F18D_schedule_problem"
 UNREACHABLE_ISSUE = "44A6E570F18D_unreachable"
 PROXY = "plant-room-bluetooth-proxy"
 PROXY_ACTION = "plant_room_bluetooth_proxy_restart_proxy"
+PROXY_SOURCE = "54:32:04:3E:F3:72"
+# habluetooth names a remote scanner "<node> (<MAC>)" - verified live via
+# bluetooth/subscribe_scanner_details on 2026-09-09. Slugified whole it
+# matches no ESPHome action.
+PROXY_SCANNER_NAME = f"{PROXY} ({PROXY_SOURCE})"
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +385,41 @@ def test_holding_proxy_is_remembered_once_per_change(issue_registry):
     assert entry.options[CONF_LAST_HOLDING_PROXY] == "living-room-bluetooth-proxy"
 
 
+def _held_through(monkeypatch, device, scanner) -> None:
+    """Route the device's link through `scanner`, recorded the way a
+    stripped-suffix miss would leave it: the display name, MAC and all."""
+    device.conn_info["active_connection_source"] = PROXY_SCANNER_NAME
+    device.conn_info["active_connection_source_address"] = PROXY_SOURCE
+    monkeypatch.setattr(recovery.bluetooth, "async_scanner_by_source", lambda hass, source: scanner)
+
+
+def test_holding_proxy_is_remembered_as_the_node_name(monkeypatch, issue_registry):
+    """The record exists to name an ESPHome action, so it is the scanner's
+    adapter (the node ESPHome registered with), never "<node> (<MAC>)"."""
+    hass = _FakeHass()
+    entry = _make_entry()
+    device = _make_device(hass)
+    _start_watcher(hass, entry, device)
+    _held_through(monkeypatch, device, SimpleNamespace(adapter=PROXY, name=PROXY_SCANNER_NAME))
+
+    device.set_connected(True)
+
+    assert entry.options[CONF_LAST_HOLDING_PROXY] == PROXY
+
+
+def test_holding_proxy_drops_the_address_suffix_when_the_scanner_has_no_adapter(monkeypatch, issue_registry):
+    hass = _FakeHass()
+    entry = _make_entry()
+    device = _make_device(hass)
+    _start_watcher(hass, entry, device)
+    _held_through(monkeypatch, device, SimpleNamespace(name=PROXY_SCANNER_NAME))
+
+    device.set_connected(True)
+
+    assert entry.options[CONF_LAST_HOLDING_PROXY] == PROXY
+    assert "(" not in entry.options[CONF_LAST_HOLDING_PROXY]
+
+
 # ---------------------------------------------------------------------------
 # Fix flow
 # ---------------------------------------------------------------------------
@@ -420,6 +460,20 @@ def test_menu_offers_the_ladder_with_restart_proxy_when_proxy_and_action_exist()
     # Nothing has been tried yet, and "None" must never reach the operator.
     assert result["description_placeholders"]["last_result"] == ""
     assert result["description_placeholders"]["name"] == entry.title
+
+
+def test_menu_offers_restart_proxy_for_the_live_holder_named_with_its_address(monkeypatch):
+    """No remembered proxy: the rung comes from the scanner holding the link
+    now, whose display name carries the MAC suffix."""
+    hass, entry, _runtime, device = _loaded_entry(
+        connected=True,
+        services={"esphome": {PROXY_ACTION: object()}},
+    )
+    _held_through(monkeypatch, device, SimpleNamespace(name=PROXY_SCANNER_NAME))
+
+    result = asyncio.run(_flow(hass, UNREACHABLE_ISSUE, entry).async_step_menu())
+
+    assert "restart_proxy" in result["menu_options"]
 
 
 def test_menu_hides_restart_proxy_when_no_proxy_is_known():

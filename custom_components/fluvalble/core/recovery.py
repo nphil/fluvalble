@@ -89,20 +89,44 @@ def link_healthy(device: Device | None) -> bool:
 
 
 def holding_proxy_name(device: Device | None) -> str | None:
-    """Return the name of the scanner carrying this fixture's link, if named.
+    """Return the ESPHome node name of the scanner carrying this fixture's link.
 
     `None` whenever there is nothing to name: no link at all, or a link
     through a local adapter, which keeps no slot accounting and so reports
     the bare CONNECTION_STATE_CONNECTED. Reads the route Device recorded
-    when GATT setup completed (refreshed on every reconnect), which is what
-    the Connection sensor renders too - e.g. `plant-room-bluetooth-proxy`.
+    when GATT setup completed (refreshed on every reconnect), then
+    normalises it to the bare node - e.g. `plant-room-bluetooth-proxy` -
+    because this name exists to be turned into
+    `esphome.<node>_restart_proxy` and to be remembered for that purpose.
+
+    habluetooth builds a remote scanner's ``name`` as "<adapter> (<source>)"
+    - verified live on 2026-09-09 via `bluetooth/subscribe_scanner_details`,
+    where every proxy reported ``name="plant-room-bluetooth-proxy
+    (54:32:04:3E:F3:72)"`` beside ``adapter="plant-room-bluetooth-proxy"``
+    and the registered action was
+    ``esphome.plant_room_bluetooth_proxy_restart_proxy``. Slugifying the
+    display name looks up an action nobody registered and the wizard's
+    proxy rung silently disappears. ``adapter`` is preferred because it is
+    the node name ESPHome registered with, so it survives the proxy's HA
+    device being renamed or moved between areas
+    (`downstairs-bluetooth-proxy` kept its node name after its HA device
+    moved to the Tool Room); the split covers a scanner that exposes only
+    its display name. Neither yields a MAC or parentheses.
     """
     if device is None or not device.connected:
         return None
     name = device.connection_state()
     if name in (CONNECTION_STATE_DISCONNECTED, CONNECTION_STATE_CONNECTED):
         return None
-    return name
+    scanner = (
+        bluetooth.async_scanner_by_source(device.hass, device.scanner_source)
+        if device.hass is not None and device.scanner_source
+        else None
+    )
+    adapter = getattr(scanner, "adapter", None)
+    if adapter:
+        return adapter
+    return name.split(" (")[0]
 
 
 @callback
