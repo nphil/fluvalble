@@ -64,6 +64,8 @@ def _stub_homeassistant():
     vol.All = lambda *args, **kwargs: lambda value: value
     vol.Range = lambda *args, **kwargs: lambda value: value
     vol.In = lambda *args, **kwargs: lambda value: value
+    # release_link's schema coerces its resume_after field.
+    vol.Coerce = lambda *args, **kwargs: lambda value: value
 
     # ---- homeassistant.exceptions ----
     class HomeAssistantError(Exception):
