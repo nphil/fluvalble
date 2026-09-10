@@ -10,13 +10,12 @@ actually hold afterwards, never who called what in which order.
 """
 
 import asyncio
-from time import monotonic
 from types import SimpleNamespace
 
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.helpers import issue_registry as ha_issue_registry
 
-from custom_components.fluvalble import DOMAIN, FluvalRuntimeData, binary_sensor, repairs
+from custom_components.fluvalble import DOMAIN, FluvalRuntimeData, async_remove_entry, binary_sensor, repairs
 from custom_components.fluvalble.core import CONF_LAST_HOLDING_PROXY, CONF_RECOVERY_OUTLET
 from custom_components.fluvalble.core import recovery
 from custom_components.fluvalble.core.device import Device
@@ -107,16 +106,42 @@ class _FakeHass:
         self.data = {DOMAIN: {}}
 
 
-class _Countdown:
-    """Stand in for async_call_later so a test can fire the deadline itself."""
+class _FakeClock:
+    """Stand in for recovery.monotonic so a test can move the outage clock.
 
-    def __init__(self) -> None:
+    Seconds only ever move forward, the way the live measurement did:
+    the watcher must never be handed a clock it can restart by being
+    rebuilt.
+    """
+
+    def __init__(self, now: float = 100_000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class _Countdown:
+    """Stand in for async_call_later, on the same fake clock as the watcher.
+
+    `fire()` behaves like the real timer: it moves the clock to the armed
+    deadline first, so a test cannot make the deadline pass without the
+    outage clock agreeing that it has.
+    """
+
+    def __init__(self, clock: _FakeClock) -> None:
+        self.clock = clock
         self.delay: float | None = None
+        self.deadline: float | None = None
         self.callback = None
         self.cancellations = 0
 
     def schedule(self, hass, delay, callback):
         self.delay = delay
+        self.deadline = self.clock.now + delay
         self.callback = callback
         return self._cancel
 
@@ -127,7 +152,17 @@ class _Countdown:
     def fire(self):
         callback, self.callback = self.callback, None
         assert callback is not None, "no countdown was armed"
+        self.clock.now = max(self.clock.now, self.deadline)
         callback(None)
+
+
+def _patch_time(monkeypatch) -> tuple[_Countdown, _FakeClock]:
+    """Put the watcher's timer and clock under the test's control."""
+    clock = _FakeClock()
+    countdown = _Countdown(clock)
+    monkeypatch.setattr(recovery, "monotonic", clock)
+    monkeypatch.setattr(recovery, "async_call_later", countdown.schedule)
+    return countdown, clock
 
 
 def _make_device(hass, *, active_time: int = 0) -> Device:
@@ -255,8 +290,7 @@ def _start_watcher(hass, entry, device=None):
 
 
 def test_unreachable_issue_waits_for_the_countdown_then_clears_on_reconnect(monkeypatch, issue_registry):
-    countdown = _Countdown()
-    monkeypatch.setattr(recovery, "async_call_later", countdown.schedule)
+    countdown, _clock = _patch_time(monkeypatch)
     hass = _FakeHass()
     entry = _make_entry()
     device = _make_device(hass)
@@ -286,8 +320,7 @@ def test_unreachable_issue_outlives_a_reload_and_is_cleared_by_the_next_watcher(
     to re-decide), and the watcher the reload builds must delete it from a
     live link state rather than from anything it remembers.
     """
-    countdown = _Countdown()
-    monkeypatch.setattr(recovery, "async_call_later", countdown.schedule)
+    countdown, _clock = _patch_time(monkeypatch)
     hass = _FakeHass()
     entry = _make_entry()
     device = _make_device(hass)
@@ -312,8 +345,7 @@ def test_unreachable_issue_is_raised_for_a_fixture_that_never_appears(monkeypatc
     That is the outage most worth reporting, so the countdown has to belong
     to the config entry rather than to a device that will never exist.
     """
-    countdown = _Countdown()
-    monkeypatch.setattr(recovery, "async_call_later", countdown.schedule)
+    countdown, _clock = _patch_time(monkeypatch)
     hass = _FakeHass()
     entry = _make_entry(title="Aquasky")
 
@@ -327,11 +359,128 @@ def test_unreachable_issue_is_raised_for_a_fixture_that_never_appears(monkeypatc
     assert issue.translation_placeholders["name"] == "Aquasky"
 
 
+def test_unreachable_repair_still_arrives_when_autoheal_reloads_the_entry_every_five_minutes(
+    monkeypatch, issue_registry
+):
+    """The measured failure: a reload every 5 minutes for as long as the
+    link is down, so a 15-minute countdown that lives in the watcher can
+    never finish.
+
+    Live on 2026-09-09 during a deliberate 21-minute power cut of the
+    aquarium light: link drop 22:24:37, automation.ble_proxy_autoheal
+    reloaded the entry at 22:35:00 and 22:40:00, each reload built a fresh
+    watcher whose countdown started at zero, and no repair ever appeared.
+    HA had not heard the fixture since its restart either, so the
+    advertisement hint could not cover it. The deadline has to stay put at
+    first-drop + 15 min across every rebuild.
+    """
+    countdown, clock = _patch_time(monkeypatch)
+    hass = _FakeHass()
+    entry = _make_entry()
+    device = _make_device(hass)
+    device.set_connected(True)
+    _watcher, stop = _start_watcher(hass, entry, device)
+    key = (DOMAIN, UNREACHABLE_ISSUE)
+
+    device.set_connected(False)
+    first_drop = clock.now
+    deadline = first_drop + recovery.UNREACHABLE_AFTER_SECONDS
+    assert countdown.deadline == deadline
+
+    # 22:35:00 and 22:40:00: the autoheal's reload_config_entry. The dead
+    # fixture is not in the BLE cache, so the rebuilt watcher has no Device.
+    for minutes_since_drop in (5, 10):
+        clock.now = first_drop + minutes_since_drop * 60
+        stop()
+        assert countdown.callback is None
+        _watcher, stop = _start_watcher(hass, entry)
+        assert countdown.deadline == deadline
+        assert key not in issue_registry.issues
+
+    countdown.fire()
+
+    assert clock.now == deadline
+    assert key in issue_registry.issues
+    stop()
+
+
+def test_a_fixture_that_never_advertises_gets_the_repair_despite_setup_retries(monkeypatch, issue_registry):
+    """Total outage: HA never hears the fixture, so no Device ever exists.
+
+    The entry still sets up (`not in BLE cache, will wait for
+    advertisement`) and gets rebuilt on every autoheal sweep. The clock
+    must be recorded on that waiting path, and rebuilding must not push
+    the deadline out.
+    """
+    countdown, clock = _patch_time(monkeypatch)
+    hass = _FakeHass()
+    entry = _make_entry(title="Aquasky")
+    key = (DOMAIN, UNREACHABLE_ISSUE)
+
+    _watcher, stop = _start_watcher(hass, entry)
+    deadline = clock.now + recovery.UNREACHABLE_AFTER_SECONDS
+    assert countdown.deadline == deadline
+
+    for _ in range(3):
+        clock.advance(4 * 60)
+        stop()
+        _watcher, stop = _start_watcher(hass, entry)
+        assert countdown.deadline == deadline
+        assert key not in issue_registry.issues
+
+    # The fourth rebuild happens after the deadline: no timer, repair now.
+    clock.advance(4 * 60)
+    stop()
+    _watcher, stop = _start_watcher(hass, entry)
+
+    assert countdown.callback is None
+    assert issue_registry.issues[key].translation_placeholders["name"] == "Aquasky"
+
+
+def test_a_recovered_link_gets_a_full_window_on_its_next_drop(monkeypatch, issue_registry):
+    """The reload-proof clock must not outlive the outage it measured."""
+    countdown, clock = _patch_time(monkeypatch)
+    hass = _FakeHass()
+    entry = _make_entry()
+    device = _make_device(hass)
+    _watcher, stop = _start_watcher(hass, entry, device)
+
+    clock.advance(10 * 60)
+    device.set_connected(True)
+    clock.advance(60)
+    device.set_connected(False)
+
+    assert countdown.deadline == clock.now + recovery.UNREACHABLE_AFTER_SECONDS
+    assert (DOMAIN, UNREACHABLE_ISSUE) not in issue_registry.issues
+    stop()
+
+
+def test_removing_the_entry_forgets_the_outage_and_its_repair(monkeypatch, issue_registry):
+    """Permanent removal must leave nothing behind for a re-added fixture."""
+    countdown, clock = _patch_time(monkeypatch)
+    hass = _FakeHass()
+    entry = _make_entry()
+    _watcher, stop = _start_watcher(hass, entry)
+    countdown.fire()
+    assert (DOMAIN, UNREACHABLE_ISSUE) in issue_registry.issues
+
+    stop()
+    asyncio.run(async_remove_entry(hass, entry))
+    assert (DOMAIN, UNREACHABLE_ISSUE) not in issue_registry.issues
+
+    # Re-adding the fixture straight away starts a fresh window.
+    clock.advance(60)
+    _watcher, stop = _start_watcher(hass, entry)
+
+    assert countdown.deadline == clock.now + recovery.UNREACHABLE_AFTER_SECONDS
+    assert (DOMAIN, UNREACHABLE_ISSUE) not in issue_registry.issues
+    stop()
+
+
 def test_unreachable_issue_is_raised_at_setup_when_the_fixture_has_been_silent(monkeypatch, issue_registry):
     """A reload must not hand a long-dead fixture a fresh grace period."""
-    countdown = _Countdown()
-    monkeypatch.setattr(recovery, "async_call_later", countdown.schedule)
-    silent_since = monotonic() - (recovery.UNREACHABLE_AFTER_SECONDS + 300)
+    countdown, clock = _patch_time(monkeypatch)
+    silent_since = clock.now - (recovery.UNREACHABLE_AFTER_SECONDS + 300)
     monkeypatch.setattr(
         recovery.bluetooth,
         "async_last_service_info",
@@ -348,8 +497,7 @@ def test_unreachable_issue_is_raised_at_setup_when_the_fixture_has_been_silent(m
 
 def test_idle_released_link_is_not_reported_as_unreachable(monkeypatch, issue_registry):
     """A finite active window disconnects on purpose; that is not a fault."""
-    countdown = _Countdown()
-    monkeypatch.setattr(recovery, "async_call_later", countdown.schedule)
+    countdown, _clock = _patch_time(monkeypatch)
     hass = _FakeHass()
     device = _make_device(hass, active_time=120)
     device.touch_seen(notify=False)
@@ -547,8 +695,7 @@ def test_flow_aborts_when_the_config_entry_is_gone():
 
 def test_finishing_the_flow_also_reconciles_the_watchers_view(monkeypatch, issue_registry):
     """HA removes the issue on create_entry; the watcher must agree, not re-raise."""
-    countdown = _Countdown()
-    monkeypatch.setattr(recovery, "async_call_later", countdown.schedule)
+    countdown, _clock = _patch_time(monkeypatch)
     monkeypatch.setattr(repairs, "SETTLE_SECONDS", 0)
     hass, entry, runtime, device = _loaded_entry(connected=False)
     watcher, _stop = _start_watcher(hass, entry, device)

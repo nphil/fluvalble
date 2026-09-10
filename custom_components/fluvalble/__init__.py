@@ -39,7 +39,12 @@ from .core.device import Device
 from .core.discovery import CONF_MODEL, CONF_PRODUCT_ID
 from .core.effects import EFFECT_NONE, WEATHER_EFFECTS, effect_name
 from .core.guardian import ScheduleGuardian, async_setup_guardian, issue_id_for_mac
-from .core.recovery import LinkWatcher, async_setup_link_watcher, unreachable_issue_id_for_mac
+from .core.recovery import (
+    LinkWatcher,
+    async_forget_link_outage,
+    async_setup_link_watcher,
+    unreachable_issue_id_for_mac,
+)
 
 try:
     from homeassistant.config_entries import ConfigEntryState
@@ -535,7 +540,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: FluvalConfigEntry) -> bo
     _store_entry_runtime_data(hass, entry, runtime)
     # Before any device can be created below: an unreachable fixture never
     # produces a Device at all, and that outage is the one most worth
-    # reporting, so the countdown is owned by the entry.
+    # reporting, so the countdown is owned by the entry. This also covers
+    # the "not in BLE cache, will wait for advertisement" path - setup
+    # completes and the watcher counts down from the first drop the process
+    # recorded, which this reload did not reset (core/recovery docstring).
     runtime.link_watcher = async_setup_link_watcher(hass, entry, mac)
     last_discovery_log = 0.0
 
@@ -1663,3 +1671,4 @@ async def async_remove_entry(hass: HomeAssistant, entry: FluvalConfigEntry) -> N
         return
     ir.async_delete_issue(hass, DOMAIN, issue_id_for_mac(mac))
     ir.async_delete_issue(hass, DOMAIN, unreachable_issue_id_for_mac(mac))
+    async_forget_link_outage(hass, mac)

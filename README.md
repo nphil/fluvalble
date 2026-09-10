@@ -229,8 +229,11 @@ interval.
 **Repairs and the recovery wizard.** Two repair notifications can appear
 under **Settings → System → Repairs**: *schedule problem* (above) and
 *unreachable*, raised once Home Assistant has been unable to hold a
-connection to the fixture for 15 minutes. Both clear themselves the moment
-the condition ends - including across a reload, since each is reconciled
+connection to the fixture for 15 minutes. The 15 minutes count from the
+first drop and keep counting across integration reloads - a heal
+automation that reloads the entry every few minutes while the link is
+down does not restart the window. Both clear themselves the moment the
+condition ends - including across a reload, since each is reconciled
 against what the repairs registry actually holds rather than against
 remembered state - and both have a **Fix** button that walks up a recovery
 ladder:

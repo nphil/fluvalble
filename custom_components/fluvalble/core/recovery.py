@@ -21,6 +21,28 @@ deletes it the moment the link returns, and writes down which proxy was
 carrying the link while it was up: while a fixture is unreachable there is
 no current holding scanner left to discover, so the fix flow has no proxy
 to offer restarting unless it was recorded in advance.
+
+The moment the link went down is kept per BLE address in
+``hass.data[DOMAIN]``, not on the watcher, because the watcher is rebuilt
+with the config entry and the entry is rebuilt for as long as the link is
+down. Measured live on 2026-09-09 during a deliberate 21-minute power cut
+of the aquarium light, with the first version of this file keeping the
+timestamp on the watcher::
+
+    22:19:04  entry setup            -> countdown starts
+    22:24:37  link drop              -> countdown (re)armed
+    22:35:00  autoheal reload        -> fresh watcher, countdown restarts at zero
+    22:40:00  autoheal reload        -> fresh watcher, countdown restarts at zero
+
+``automation.ble_proxy_autoheal`` calls ``homeassistant.reload_config_entry``
+on any device whose link is down, every 5 minutes, so a 15-minute window
+owned by anything the reload throws away is unreachable by construction.
+HA's own last-advertisement timestamp did not cover it either: the fixture
+had not been heard since HA restarted (``not in BLE cache, will wait for
+advertisement``), which is exactly the case that hint contributes zero for.
+A watcher therefore only ever *records* a first-drop time it finds absent,
+never overwrites one, and arms its timer for whatever is left of the
+window rather than for a fresh one.
 """
 
 from __future__ import annotations
@@ -53,6 +75,27 @@ UNREACHABLE_AFTER_SECONDS = 15 * 60
 # Suffix of the unreachable repair's issue_id. Shared with repairs.py, which
 # has to tell this integration's two repairs apart from the id alone.
 UNREACHABLE_ISSUE_SUFFIX = "_unreachable"
+
+# hass.data[DOMAIN] key of the {MAC: monotonic()} map recording when each
+# fixture's link was first seen down. Process-scoped on purpose - see the
+# module docstring for the reload that made anything entry-scoped useless.
+# async_unload_entry only pops the entry's own key, so this survives it.
+LINK_DOWN_SINCE = "_link_down_since"
+
+
+def _link_down_since(hass: HomeAssistant) -> dict[str, float]:
+    """Return the process-scoped first-drop clock, creating it on first use."""
+    return hass.data.setdefault(DOMAIN, {}).setdefault(LINK_DOWN_SINCE, {})
+
+
+@callback
+def async_forget_link_outage(hass: HomeAssistant, mac: str) -> None:
+    """Drop the recorded first-drop time for one fixture.
+
+    Called when the link is healthy again and when the config entry is
+    removed for good, so a fixture added back later starts a fresh window.
+    """
+    hass.data.get(DOMAIN, {}).get(LINK_DOWN_SINCE, {}).pop(mac.upper(), None)
 
 
 def unreachable_issue_id_for_mac(mac: str) -> str:
@@ -196,6 +239,11 @@ class LinkWatcher:
     GATT transitions and the reachability window expiring - once
     `attach` is called.
 
+    The watcher owns the timer but not the clock: the first-drop time it
+    counts from lives in hass.data (LINK_DOWN_SINCE) and outlives it, so
+    the watcher a reload builds picks up the remaining part of the window
+    instead of a new one.
+
     Every notification converges three things: the countdown towards
     raising the repair, the repair itself, and the remembered holding proxy
     the fix flow needs while the fixture is unreachable.
@@ -208,7 +256,6 @@ class LinkWatcher:
         self.mac = mac.upper()
         self.device: Device | None = None
         self.issue_id = unreachable_issue_id_for_mac(mac)
-        self._down_since: float | None = None
         self._countdown_unsub: Callable[[], None] | None = None
         # Same reason FluvalEntity keeps one: deregistration has to hand
         # back the exact object that was registered.
@@ -234,6 +281,10 @@ class LinkWatcher:
         watcher's setup-time reconcile decides, with the live link state in
         front of it, whether the repair still belongs there. Permanent
         removal is cleaned up by async_remove_entry() in __init__.py.
+
+        Cancelling the timer is likewise safe only because the clock it was
+        measuring is not cancelled with it: the next watcher's start()
+        re-arms for the time that is left, or raises at once if none is.
         """
         self._cancel_countdown()
         if self.device is not None:
@@ -249,37 +300,40 @@ class LinkWatcher:
         the one that raised it.
         """
         if link_healthy(self.device):
-            self._down_since = None
             self._cancel_countdown()
+            async_forget_link_outage(self.hass, self.mac)
             self._remember_holding_proxy()
             self._set_issue(raised=False)
             return
 
-        if self._down_since is None:
-            self._down_since = monotonic()
-        if self._outage_seconds() >= UNREACHABLE_AFTER_SECONDS:
+        # Record only if absent: a watcher rebuilt mid-outage must inherit
+        # the first drop, never restamp it.
+        _link_down_since(self.hass).setdefault(self.mac, monotonic())
+        remaining = UNREACHABLE_AFTER_SECONDS - self._outage_seconds()
+        if remaining <= 0:
             self._cancel_countdown()
             self._set_issue(raised=True)
             return
         # Not long enough yet - and a dead link produces no further
         # notifications, so the deadline has to come from a timer.
-        self._arm_countdown()
+        self._arm_countdown(remaining)
 
     def _outage_seconds(self) -> float:
         """Return how long this fixture is known to have been unreachable.
 
-        Two sources, whichever is more damning. This watcher's own clock is
-        the normal one, but it starts at zero on every reload, which would
-        hand a fixture that has been dead for hours a fresh 15-minute grace
-        period. Home Assistant's Bluetooth stack keeps the monotonic
-        timestamp of the last connectable advertisement it heard from this
-        address, which does survive a reload (same process), so a fixture
-        that has not been heard from at all is known to have been gone at
-        least that long. Nothing heard is not evidence of anything - the
-        state right after an HA restart - so it contributes zero and the
-        countdown gets to run its full window.
+        Two sources, whichever is more damning. The process-scoped
+        first-drop clock is the reliable one: it is recorded once per
+        outage and survives the entry reloads the autoheal automation
+        issues while the link is down. Home Assistant's Bluetooth stack
+        additionally keeps the monotonic timestamp of the last connectable
+        advertisement it heard from this address, which can predate the
+        first drop this process observed (an outage that began before HA
+        or this integration started watching). Nothing heard is not
+        evidence of anything - the state right after an HA restart - so
+        that hint contributes zero and the clock decides alone.
         """
-        watched = 0.0 if self._down_since is None else monotonic() - self._down_since
+        down_since = _link_down_since(self.hass).get(self.mac)
+        watched = 0.0 if down_since is None else monotonic() - down_since
         return max(watched, self._advertisement_silence())
 
     def _advertisement_silence(self) -> float:
@@ -303,15 +357,18 @@ class LinkWatcher:
             return 0.0
         return max(0.0, monotonic() - float(heard_at))
 
-    def _arm_countdown(self) -> None:
-        """Schedule the unreachable deadline, without stacking timers."""
+    def _arm_countdown(self, remaining: float) -> None:
+        """Schedule the unreachable deadline, without stacking timers.
+
+        Idempotent: an armed timer was computed from the same first-drop
+        time and both grow at the same rate, so it already carries this
+        deadline. `remaining` is the rest of the window, not a full one -
+        that is the difference between this and the version measured
+        never to fire (module docstring).
+        """
         if self._countdown_unsub is not None:
             return
-        self._countdown_unsub = async_call_later(
-            self.hass,
-            UNREACHABLE_AFTER_SECONDS,
-            self._on_countdown_elapsed,
-        )
+        self._countdown_unsub = async_call_later(self.hass, remaining, self._on_countdown_elapsed)
 
     def _cancel_countdown(self) -> None:
         """Cancel the pending unreachable deadline."""
@@ -321,18 +378,16 @@ class LinkWatcher:
 
     @callback
     def _on_countdown_elapsed(self, _now: Any) -> None:
-        """Raise the repair now that the window this timer measured is over.
+        """Re-read live state now that the deadline has passed.
 
-        The timer is the duration evidence - deriving it again from
-        `_outage_seconds` here would be circular - so the only question
-        left is whether the link happens to be back, in which case the
-        full reconcile takes over and clears everything instead.
+        Nothing is concluded from the timer having fired: the link may be
+        back, or the clock may have been cleared meanwhile, and reconcile
+        reads both. When the fixture is still down the process clock now
+        says the window is over, so this raises through the same path a
+        setup-time reconcile of a long-dead fixture takes.
         """
         self._countdown_unsub = None
-        if link_healthy(self.device):
-            self.reconcile()
-            return
-        self._set_issue(raised=True)
+        self.reconcile()
 
     @callback
     def _set_issue(self, *, raised: bool) -> None:
