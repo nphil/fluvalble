@@ -28,7 +28,9 @@ from .core import (
     CONFIG_ENTRY_VERSION,
     CONF_ACTIVE_TIME,
     CONF_EXPECTED_SCHEDULE,
+    CONF_LAST_HOLDING_PROXY,
     CONF_PING_INTERVAL,
+    CONF_RECOVERY_OUTLET,
     DEFAULT_ACTIVE_TIME,
     DEFAULT_PING_INTERVAL,
     DOMAIN,
@@ -37,6 +39,7 @@ from .core.device import Device
 from .core.discovery import CONF_MODEL, CONF_PRODUCT_ID
 from .core.effects import EFFECT_NONE, WEATHER_EFFECTS, effect_name
 from .core.guardian import ScheduleGuardian, async_setup_guardian, issue_id_for_mac
+from .core.recovery import LinkWatcher, async_setup_link_watcher, unreachable_issue_id_for_mac
 
 try:
     from homeassistant.config_entries import ConfigEntryState
@@ -62,8 +65,13 @@ class FluvalRuntimeData:
 
     device: Device | None = None
     guardian: ScheduleGuardian | None = None
+    link_watcher: LinkWatcher | None = None
     pending_add_entities: dict[Platform, Any] = field(default_factory=dict)
     background_tasks: set[asyncio.Task] = field(default_factory=set, repr=False)
+    # Options this entry was set up with, minus the recovery bookkeeping the
+    # link watcher and the fix flow write themselves - see
+    # _async_update_listener for why the difference matters.
+    setup_options: dict[str, Any] = field(default_factory=dict, repr=False)
 
 
 try:
@@ -523,8 +531,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: FluvalConfigEntry) -> bo
     _migrate_legacy_registry_entries(hass, entry, mac)
     _cleanup_duplicate_devices(hass, entry, mac)
 
-    runtime = FluvalRuntimeData()
+    runtime = FluvalRuntimeData(setup_options=_reload_relevant_options(entry))
     _store_entry_runtime_data(hass, entry, runtime)
+    # Before any device can be created below: an unreachable fixture never
+    # produces a Device at all, and that outage is the one most worth
+    # reporting, so the countdown is owned by the entry.
+    runtime.link_watcher = async_setup_link_watcher(hass, entry, mac)
     last_discovery_log = 0.0
 
     def create_runtime_task(coroutine) -> asyncio.Task:
@@ -571,6 +583,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: FluvalConfigEntry) -> bo
         )
         _sync_product_identity(hass, entry, device)
         runtime.guardian = async_setup_guardian(hass, entry, device)
+        # Hands the watcher this device's connection notifications; until
+        # now it has been counting down without one.
+        if runtime.link_watcher is not None:
+            runtime.link_watcher.attach(device)
 
         # Retroactively add entities for platforms that set up before the
         # device was available (they stashed their add_entities callback).
@@ -766,8 +782,26 @@ def _register_legacy_options_reload(entry: ConfigEntry) -> None:
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
 
+# Options this integration writes to itself rather than through the options
+# form. None of them change how the entry is set up, so none of them may
+# trigger a reload: `last_holding_proxy` is rewritten whenever the link
+# lands on a different proxy, and a reload-per-connect would be a reload
+# loop for exactly the flapping link this recovery machinery exists for.
+RECOVERY_OPTION_KEYS = frozenset({CONF_LAST_HOLDING_PROXY, CONF_RECOVERY_OUTLET})
+
+
+def _reload_relevant_options(entry: ConfigEntry) -> dict[str, Any]:
+    """Return the entry options whose change requires a reload to apply."""
+    return {key: value for key, value in entry.options.items() if key not in RECOVERY_OPTION_KEYS}
+
+
 async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Reload options on Home Assistant versions without the reload helper."""
+    runtime = entry_runtime_data(hass, entry)
+    current = _reload_relevant_options(entry)
+    if runtime is not None and runtime.setup_options == current:
+        _LOGGER.debug("Skipping Fluval reload for %s: only recovery options changed", entry.entry_id)
+        return
     await hass.config_entries.async_reload(entry.entry_id)
 
 
@@ -1616,13 +1650,16 @@ async def async_remove_entry(hass: HomeAssistant, entry: FluvalConfigEntry) -> N
 
     Runs only when the user removes the config entry entirely - unlike
     async_unload_entry, which also runs on every routine reload (including
-    one triggered by an options change). Deleting the guardian's
-    schedule-problem repair there would silently clear a still-valid
-    "problem" alert on reload, before the freshly built guardian has run
-    enough checks to know the fixture is still broken. Permanent removal has
-    no such risk, so the repair is dropped for good here instead.
+    one triggered by an options change). Deleting this integration's repairs
+    there would clear an alert with nothing left running to re-decide
+    whether it still applies; while the entry is loaded that decision is
+    made by reconciliation against the issue registry instead (see
+    core/recovery.reconcile_issue). Permanent removal has no such
+    ambiguity - there is no device left to be unwell - so both repairs are
+    dropped for good here.
     """
     mac = entry.data.get(CONF_MAC)
     if not mac:
         return
     ir.async_delete_issue(hass, DOMAIN, issue_id_for_mac(mac))
+    ir.async_delete_issue(hass, DOMAIN, unreachable_issue_id_for_mac(mac))

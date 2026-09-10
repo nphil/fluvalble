@@ -106,6 +106,10 @@ CHECK_OVERALL_TIMEOUT = 120.0
 # that supervision is not actually skipped.
 DEFERRED_RETRY_SECONDS = 20
 
+# Suffix of the schedule-problem repair's issue_id. Shared with repairs.py,
+# which has to tell this integration's two repairs apart from the id alone.
+SCHEDULE_PROBLEM_ISSUE_SUFFIX = "_schedule_problem"
+
 
 def issue_id_for_mac(mac: str) -> str:
     """Return the repairs issue_id for one device's schedule-problem alert, by MAC.
@@ -114,7 +118,7 @@ def issue_id_for_mac(mac: str) -> str:
     entry's stored MAC (e.g. async_remove_entry, after the Device may already
     be gone) can compute the exact same id without constructing a device.
     """
-    return f"{mac.upper().replace(':', '')}_schedule_problem"
+    return f"{mac.upper().replace(':', '')}{SCHEDULE_PROBLEM_ISSUE_SUFFIX}"
 
 
 def issue_id_for(device: Any) -> str:

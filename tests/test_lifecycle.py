@@ -110,9 +110,45 @@ def test_legacy_options_listener_reloads_once():
 
 async def _async_test_legacy_options_listener_reloads_once():
     reload_entry = AsyncMock()
-    hass = SimpleNamespace(config_entries=SimpleNamespace(async_reload=reload_entry))
-    entry = SimpleNamespace(entry_id="entry_1")
+    hass = SimpleNamespace(
+        data={DOMAIN: {}},
+        config_entries=SimpleNamespace(async_reload=reload_entry),
+    )
+    entry = SimpleNamespace(entry_id="entry_1", options={"expected_mode": "pro"})
 
+    await _async_update_listener(hass, entry)
+
+    reload_entry.assert_awaited_once_with("entry_1")
+
+
+def test_legacy_options_listener_ignores_recovery_option_writes():
+    """The link watcher's own bookkeeping must never reload the entry.
+
+    `last_holding_proxy` is rewritten whenever the link lands on a different
+    proxy, so reloading on it would mean a reload per reconnect - a reload
+    loop for exactly the flapping link the watcher exists to report.
+    """
+    asyncio.run(_async_test_legacy_options_listener_ignores_recovery_option_writes())
+
+
+async def _async_test_legacy_options_listener_ignores_recovery_option_writes():
+    reload_entry = AsyncMock()
+    runtime = FluvalRuntimeData(setup_options={"expected_mode": "pro"})
+    entry = SimpleNamespace(
+        entry_id="entry_1",
+        options={"expected_mode": "pro", "last_holding_proxy": "plant-room-bluetooth-proxy"},
+        runtime_data=runtime,
+    )
+    hass = SimpleNamespace(
+        data={DOMAIN: {entry.entry_id: runtime}},
+        config_entries=SimpleNamespace(async_reload=reload_entry),
+    )
+
+    await _async_update_listener(hass, entry)
+
+    reload_entry.assert_not_awaited()
+
+    entry.options = {"expected_mode": "auto", "last_holding_proxy": "plant-room-bluetooth-proxy"}
     await _async_update_listener(hass, entry)
 
     reload_entry.assert_awaited_once_with("entry_1")

@@ -226,6 +226,31 @@ problem turns on and Home Assistant opens a repair notification. Call
 `fluvalble.guardian_check_now` to force an immediate check outside the normal
 interval.
 
+**Repairs and the recovery wizard.** Two repair notifications can appear
+under **Settings → System → Repairs**: *schedule problem* (above) and
+*unreachable*, raised once Home Assistant has been unable to hold a
+connection to the fixture for 15 minutes. Both clear themselves the moment
+the condition ends - including across a reload, since each is reconciled
+against what the repairs registry actually holds rather than against
+remembered state - and both have a **Fix** button that walks up a recovery
+ladder:
+
+1. **Check again**, which changes nothing (a heal automation may have
+   already won).
+2. **Reload the integration**, rebuilding this light's BLE client.
+3. **Restart the Bluetooth proxy** that was carrying the link. Offered only
+   when the proxy is known and exposes an `esphome` restart action; the
+   proxy firmware refuses a restart while its own uptime is under 20
+   minutes, so the wizard says it may have been declined rather than
+   claiming a reboot.
+4. **Cut and restore mains power** through a switch you pick (remembered for
+   next time) - the last resort.
+
+A schedule problem starts one rung earlier, with a re-push of the expected
+mode and schedule through the guardian, before offering the ladder. The
+proxy holding the link is recorded in the entry's options while the link is
+up, because there is nothing left to discover once the fixture is gone.
+
 **Sharing the connection.** With the default held link Home Assistant keeps
 the fixture's single BLE slot for as long as the integration is loaded. Set a
 finite **Active connection window** (`30`–`600` s) to share instead: Home

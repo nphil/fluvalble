@@ -456,10 +456,12 @@ class OptionsFlowHandler(OptionsFlowBase):
                     ),
                     errors={CONF_ACTIVE_TIME: "invalid_active_time"},
                 )
-            # Preserve options this form never shows - currently just the
-            # guardian's expected_schedule, written by the schedule-programming
-            # services/entities rather than this form. A plain `data=user_input`
-            # would silently wipe it on every options save.
+            # Preserve options this form never shows: the guardian's
+            # expected_schedule, written by the schedule-programming
+            # services/entities, and the recovery bookkeeping
+            # (last_holding_proxy, recovery_outlet) written by the link
+            # watcher and the repairs fix flow. A plain `data=user_input`
+            # would silently wipe all of them on every options save.
             merged = {**self._config_entry().options, **user_input}
             return self.async_create_entry(title="", data=merged)
 

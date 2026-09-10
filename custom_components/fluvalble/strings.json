@@ -66,7 +66,71 @@
   "issues": {
     "schedule_problem": {
       "title": "{name} is not following its expected schedule",
-      "description": "The Fluval BLE guardian could not keep {name} on its expected mode or schedule after repeated attempts, or the fixture has been unreachable for a while. Check that the light is powered, in Bluetooth range of a working adapter or ESPHome proxy, and not held open by the Fluval app. The guardian keeps retrying and this notification clears automatically once a check succeeds."
+      "description": "The Fluval BLE guardian could not keep {name} on its expected mode or schedule after repeated attempts, or the fixture has been unreachable for a while. Check that the light is powered, in Bluetooth range of a working adapter or ESPHome proxy, and not held open by the Fluval app. The guardian keeps retrying and this notification clears automatically once a check succeeds - or press Fix to re-push the schedule now and, if that is not enough, work up the recovery ladder.",
+      "fix_flow": {
+        "step": {
+          "repush_schedule": {
+            "title": "Re-push the schedule to {name}",
+            "description": "The guardian will end any active manual override and run a full check straight away: sync the fixture's clock, put it back in the expected mode, and write the expected schedule again if the fixture is holding a different one. This is the cheapest fix and the one that usually works, because a drifting fixture is still answering.\n\n{name} is {link}. If the re-push does not settle it, the recovery ladder is offered next."
+          },
+          "menu": {
+            "title": "Recover {name}",
+            "description": "{name} is {link}.\n\n{last_result}\n\nPick the next thing to try. They are listed cheapest first, and each one waits to see whether the light comes back before offering the list again.\n\n- **Check again** touches nothing. The household heal script and the hourly re-home often fix a dropped link on their own, so it is worth one look before changing anything.\n- **Reload the integration** rebuilds this light's Bluetooth client from scratch and asks Home Assistant to pick the best route again. Nothing else on the system is affected.\n- **Restart the Bluetooth proxy** reboots the ESPHome node that was carrying this light's connection. Every other device on that proxy loses its link for the reboot, and the proxy firmware refuses a restart while its own uptime is under 20 minutes, so the request can be declined without anything happening.\n- **Cut and restore mains power** switches the light's outlet off for 10 seconds and back on. It is the last resort: it interrupts the fixture itself, and the light comes back on whatever its onboard schedule says.",
+            "menu_options": {
+              "recheck": "Check again without changing anything",
+              "reload": "Reload the integration (cheapest)",
+              "restart_proxy": "Restart the Bluetooth proxy carrying this light",
+              "power_cycle": "Cut and restore mains power to the light (last resort)"
+            }
+          },
+          "power_cycle": {
+            "title": "Power-cycle {name}",
+            "description": "This switches the outlet off, waits 10 seconds, and switches it back on, cutting mains power to {name} - so anything else on the same outlet goes off with it. Pick the switch that feeds the light; it is remembered for next time.\n\nThe light is {link} right now.",
+            "data": {
+              "recovery_outlet": "Switch that powers this light"
+            },
+            "data_description": {
+              "recovery_outlet": "The switch entity controlling the light's mains outlet. Stored in this light's options so the next power cycle is one click."
+            }
+          }
+        },
+        "abort": {
+          "entry_gone": "This Fluval light is no longer configured in Home Assistant, so there is nothing left to recover.",
+          "entry_not_loaded": "This Fluval light is not loaded right now, so its guardian cannot be asked to do anything. Reload the integration and try again."
+        }
+      }
+    },
+    "device_unreachable": {
+      "title": "{name} has been unreachable for {minutes} minutes",
+      "description": "Home Assistant has not been able to hold a Bluetooth connection to {name} for {minutes} minutes. The last proxy known to carry this light was {proxy}. Until the link is back the light keeps running whatever schedule is stored in the fixture itself, but Home Assistant can neither read nor change it, and the guardian cannot correct drift.\n\nThis notification clears itself the moment the link returns. Press Fix to work up the recovery ladder - check again, reload the integration, restart the proxy that was carrying the link, or power-cycle the light.",
+      "fix_flow": {
+        "step": {
+          "menu": {
+            "title": "Recover {name}",
+            "description": "{name} is {link}.\n\n{last_result}\n\nPick the next thing to try. They are listed cheapest first, and each one waits to see whether the light comes back before offering the list again.\n\n- **Check again** touches nothing. The household heal script and the hourly re-home often fix a dropped link on their own, so it is worth one look before changing anything.\n- **Reload the integration** rebuilds this light's Bluetooth client from scratch and asks Home Assistant to pick the best route again. Nothing else on the system is affected.\n- **Restart the Bluetooth proxy** reboots the ESPHome node that was carrying this light's connection. Every other device on that proxy loses its link for the reboot, and the proxy firmware refuses a restart while its own uptime is under 20 minutes, so the request can be declined without anything happening.\n- **Cut and restore mains power** switches the light's outlet off for 10 seconds and back on. It is the last resort: it interrupts the fixture itself, and the light comes back on whatever its onboard schedule says.",
+            "menu_options": {
+              "recheck": "Check again without changing anything",
+              "reload": "Reload the integration (cheapest)",
+              "restart_proxy": "Restart the Bluetooth proxy carrying this light",
+              "power_cycle": "Cut and restore mains power to the light (last resort)"
+            }
+          },
+          "power_cycle": {
+            "title": "Power-cycle {name}",
+            "description": "This switches the outlet off, waits 10 seconds, and switches it back on, cutting mains power to {name} - so anything else on the same outlet goes off with it. Pick the switch that feeds the light; it is remembered for next time.\n\nThe light is {link} right now.",
+            "data": {
+              "recovery_outlet": "Switch that powers this light"
+            },
+            "data_description": {
+              "recovery_outlet": "The switch entity controlling the light's mains outlet. Stored in this light's options so the next power cycle is one click."
+            }
+          }
+        },
+        "abort": {
+          "entry_gone": "This Fluval light is no longer configured in Home Assistant, so there is nothing left to recover.",
+          "entry_not_loaded": "This Fluval light is not loaded right now, so its guardian cannot be asked to do anything. Reload the integration and try again."
+        }
+      }
     }
   },
   "entity": {

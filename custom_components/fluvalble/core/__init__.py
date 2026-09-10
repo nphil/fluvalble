@@ -46,6 +46,15 @@ DEFAULT_ALERT_AFTER_FAILURES = 3  # consecutive correction failures before the p
 # guardian knows the schedule it should keep enforcing on the fixture.
 CONF_EXPECTED_SCHEDULE = "expected_schedule"
 
+# Recovery keys inside ConfigEntry.options, also outside the options form
+# schema. `last_holding_proxy` is written by the link watcher whenever a link
+# is up, because while a fixture is unreachable there is no current holding
+# scanner left to discover and the repairs fix flow would otherwise have no
+# proxy to offer restarting. `recovery_outlet` remembers the switch the
+# operator picked the last time they power-cycled the fixture from that flow.
+CONF_LAST_HOLDING_PROXY = "last_holding_proxy"
+CONF_RECOVERY_OUTLET = "recovery_outlet"
+
 # Guardian expected-mode options (options flow + ScheduleGuardian)
 EXPECTED_MODE_AUTO = "auto"
 EXPECTED_MODE_PRO = "pro"

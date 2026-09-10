@@ -5,6 +5,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- New repair `<mac>_unreachable`, raised once Home Assistant has been unable to hold a BLE link to the fixture for 15 minutes and deleted the moment the link returns. Both this and the existing schedule-problem repair are now fixable: the **Fix** button opens a recovery wizard that escalates from checking again, through reloading the integration and restarting the ESPHome proxy that was carrying the link, to cutting and restoring mains power through a switch you pick (remembered in the entry's options for next time). A schedule problem starts one rung earlier by re-pushing the expected mode and schedule through the guardian. The proxy restart is only offered when a proxy is known and exposes the matching `esphome` action, and is reported honestly - the proxy firmware refuses a restart while its own uptime is under 20 minutes, so the wizard never claims a reboot it cannot confirm.
+- The proxy carrying the link is recorded in the config entry's options (`last_holding_proxy`) whenever the link is up, since there is no holding scanner left to discover once the fixture is unreachable. It is written only when it changes, and never triggers a reload.
+
+### Fixed
+- A repair could outlive the condition that raised it. Live: `44A6E570F18D_schedule_problem` was raised at 12:22, the config entry reloaded at 12:38, the guardian cleared the condition at 13:00, and the repair was still open 13 hours later - deletion was gated on an in-memory "previously synced" flag that the reload had reset, so the first notification afterwards recorded the new state without syncing. Repairs are now reconciled against what the repairs registry actually holds, on every guardian notification and once when the entity is added to Home Assistant, so a reload always converges.
+
 ## [1.2.0]
 
 ### Added
