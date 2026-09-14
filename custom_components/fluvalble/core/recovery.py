@@ -181,7 +181,7 @@ def reconcile_issue(
     severity: ir.IssueSeverity,
     translation_key: str,
     translation_placeholders: dict[str, str],
-    is_fixable: bool = True,
+    is_fixable: bool = False,
     data: dict[str, Any] | None = None,
 ) -> None:
     """Make the issue registry match reality for one of this domain's repairs.
