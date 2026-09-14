@@ -396,7 +396,7 @@ class LinkWatcher:
             self.hass,
             self.issue_id,
             raised=raised,
-            is_fixable=True,
+            is_fixable=False,
             severity=ir.IssueSeverity.WARNING,
             translation_key="device_unreachable",
             translation_placeholders={

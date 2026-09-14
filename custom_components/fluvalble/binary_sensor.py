@@ -92,7 +92,7 @@ class FluvalScheduleProblemBinarySensor(FluvalGuardianEntity, BinarySensorEntity
             self.device.hass,
             issue_id_for(self.device),
             raised=self.guardian.problem,
-            is_fixable=True,
+            is_fixable=False,
             severity=ir.IssueSeverity.ERROR,
             translation_key="schedule_problem",
             translation_placeholders={"name": self.device.name or "Fluval"},
