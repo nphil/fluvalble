@@ -77,6 +77,7 @@ def test_options_flow_uses_saved_values_as_suggestions():
         "active_time": 0,
     }
     flow = OptionsFlowHandler()
+    flow.hass = MagicMock()
     flow.config_entry.options = options
     suggested_schema = object()
     flow.add_suggested_values_to_schema = MagicMock(return_value=suggested_schema)
@@ -109,6 +110,7 @@ def test_options_flow_submission_is_owned_by_reload_helper():
 def test_options_flow_rejects_connection_windows_between_one_and_twenty_nine():
     """The serializable numeric schema retains the documented validation gap."""
     flow = OptionsFlowHandler()
+    flow.hass = MagicMock()
     suggested_schema = object()
     flow.add_suggested_values_to_schema = MagicMock(return_value=suggested_schema)
     flow.async_show_form = MagicMock(return_value={"type": "form"})

@@ -196,6 +196,7 @@ class Client:
         state_ready_callback: StateReadyCallback | None = None,
         activity_callback: Callable[[], None] | None = None,
         hold_stats: ConnectionHoldStats | None = None,
+        client_class: type[BleakClient] | None = None,
     ) -> None:
         """Initialize the client."""
         self.device = device
@@ -212,6 +213,10 @@ class Client:
         # honest while the fixture is answering us over GATT.
         self.activity_callback = activity_callback
         self.hold_stats = hold_stats if hold_stats is not None else ConnectionHoldStats()
+        # Device may hand us a BleakClient subclass that prefers one proxy
+        # (see core/device.py `_affinity_client_class`); default to the
+        # plain habluetooth-wrapped class when it does not.
+        self._client_class = client_class or BleakClient
         self._ping_interval = ping_interval
         self._active_time = active_time
         self.connection_attempts = 0
@@ -466,7 +471,7 @@ class Client:
             try:
                 client = await self._bounded(
                     establish_connection(
-                        BleakClient,
+                        self._client_class,
                         device,
                         device.address,
                         disconnected_callback=self._on_disconnected,

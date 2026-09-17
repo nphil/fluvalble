@@ -7,6 +7,7 @@ CONFIG_ENTRY_VERSION = 2
 CONF_PING_INTERVAL = "ping_interval"
 CONF_ACTIVE_TIME = "active_time"
 CONF_LAMP_PROFILE = "lamp_profile"
+CONF_PREFERRED_PROXY = "preferred_proxy"
 DEFAULT_PING_INTERVAL = 10  # seconds between keep-alive reads
 # 0 = hold the GATT link permanently (the default: a held link answers a
 # command in ~0.4-2 s where a fresh ESPHome-proxy connect costs 2-6 s). Values
@@ -14,6 +15,11 @@ DEFAULT_PING_INTERVAL = 10  # seconds between keep-alive reads
 # lives in `config_flow.validate_active_time` and is unchanged.
 DEFAULT_ACTIVE_TIME = 0
 DEFAULT_LAMP_PROFILE = "auto"
+# "" = automatic (habluetooth's own RSSI-based scanner selection, unchanged).
+# Any other value is the ESPHome node name of the proxy this fixture should
+# prefer while it is advertising and has a free slot; bounded fallback to
+# automatic after repeated failures - see `ble_affinity.py`.
+DEFAULT_PREFERRED_PROXY = ""
 
 # Lamp profile options (options flow + channel layout)
 LAMP_PROFILE_AUTO = "auto"

@@ -12,6 +12,7 @@ import time
 from typing import Any, Concatenate, ParamSpec, TypeVar, TypedDict, cast
 
 from bleak import AdvertisementData, BLEDevice, BleakError, BleakScanner
+import bleak_retry_connector as brc
 from homeassistant.components import bluetooth
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.event import async_track_point_in_time
@@ -26,6 +27,7 @@ from . import (
     LAMP_PROFILE_PLANT,
     LAMP_PROFILE_PLANT_PRO,
 )
+from ..ble_affinity import make_affinity_client_class
 from .client import Client, ConnectionHoldStats
 from .color import channel_percentages_to_rgb, rgb_to_channel_percentages
 from .discovery import (
@@ -416,6 +418,7 @@ class Device:
         config_data: dict[str, Any] | None = None,
         ping_interval: int = 10,
         active_time: int = 120,
+        preferred_getter: Callable[[], str | None] | None = None,
     ) -> None:
         """Initialize the device."""
         config_data = config_data or {}
@@ -444,6 +447,12 @@ class Device:
         self.client: Client | None = None
         self._ping_interval = ping_interval
         self._active_time = active_time
+        # Reads the live `preferred_proxy` option on every connect (see
+        # `_affinity_client_class`); defaults to "always automatic" for
+        # callers (mostly tests) that construct a Device with no getter.
+        self._preferred_getter = preferred_getter or (lambda: None)
+        self._client_class: type | None = None
+        self._via_preferred_proxy = False
         self.connected = False
         self.entry_id: str | None = None
         self.schedule_mode = "manual"
@@ -757,12 +766,20 @@ class Device:
         (`ConnectionHoldStats`), not from habluetooth: habluetooth counts
         failures to *connect*, never a link that dropped after connecting,
         so nothing else in the stack knows a held link went away.
+
+        `preferred_proxy` is the configured affinity target (empty =
+        automatic); `via_preferred_proxy` is whether the most recent
+        connect actually used it - `make_affinity_client_class` falls back
+        to automatic routing when the preferred proxy cannot currently see
+        the fixture or has failed repeatedly, so the two can disagree.
         """
         return {
             "hold": self.hold_active,
             "drops_1h": self.hold_stats.drops_in_window(),
             "last_drop": self.hold_stats.last_drop_iso(),
             "reconnect_attempt": self.hold_stats.reconnect_attempt,
+            "preferred_proxy": self._preferred_getter() or "",
+            "via_preferred_proxy": self._via_preferred_proxy,
         }
 
     def cancel_reachability_refresh(self) -> None:
@@ -3084,6 +3101,29 @@ class Device:
         """Return supported channel values in Fluval app order."""
         return [self.values[channel] for channel in self.numbers()]
 
+    def _affinity_client_class(self) -> type:
+        """Build (once, cached) the BleakClient subclass preferring `preferred_proxy`.
+
+        `bleak_retry_connector.BleakClient` is resolved here, not at module
+        import: HA's bluetooth integration monkeypatches it to
+        `HaBleakClientWrapper` during its own startup, and this only runs on
+        this device's first connect attempt - well after that has happened.
+        Cached on the device so a later `async_reset_connection()` (which
+        discards `self.client` and calls `_new_client` again) reuses the
+        same class instead of rebuilding it on every reconnect-from-scratch.
+        """
+        if self._client_class is None:
+            self._client_class = make_affinity_client_class(
+                brc.BleakClient,
+                self._preferred_getter,
+                on_choice=self._on_preferred_proxy_choice,
+            )
+        return self._client_class
+
+    def _on_preferred_proxy_choice(self, scanner_name: str, preferred_used: bool) -> None:
+        """Record whether the most recent connect used the preferred proxy."""
+        self._via_preferred_proxy = preferred_used
+
     def _new_client(self, device: BLEDevice) -> Client:
         """Create a client that refreshes HA's preferred BLE route on reconnect."""
         return Client(
@@ -3098,6 +3138,7 @@ class Device:
             state_ready_callback=self._async_on_client_state_ready,
             activity_callback=self._on_client_activity,
             hold_stats=self.hold_stats,
+            client_class=self._affinity_client_class(),
         )
 
     async def _async_ensure_client(self) -> bool:

@@ -33,6 +33,9 @@ def _stub_bleak():
 
     brc = types.ModuleType("bleak_retry_connector")
     brc.establish_connection = MagicMock()
+    # Plain object by default (no affinity hooks - see ble_affinity.affinity_supported):
+    # tests that exercise the affinity path patch this to a fake exposing it.
+    brc.BleakClient = object
     sys.modules["bleak_retry_connector"] = brc
 
 
@@ -173,6 +176,7 @@ def _stub_homeassistant():
     ha_bt.async_last_service_info = MagicMock(return_value=None)
     ha_bt.async_scanner_by_source = MagicMock(return_value=None)
     ha_bt.async_scanner_devices_by_address = MagicMock(return_value=[])
+    ha_bt.async_current_scanners = MagicMock(return_value=[])
     ha_bt.async_register_callback = MagicMock(return_value=lambda: None)
 
     ha_comp = types.ModuleType("homeassistant.components")
@@ -319,12 +323,26 @@ def _stub_homeassistant():
     # ---- homeassistant.helpers.selector ----
     ha_selector = types.ModuleType("homeassistant.helpers.selector")
     ha_selector.EntitySelectorConfig = dict
+    ha_selector.SelectSelectorConfig = dict
 
     class _FakeEntitySelector:
         def __init__(self, config=None):
             self.config = config or {}
 
+    class _FakeSelectSelector:
+        def __init__(self, config=None):
+            self.config = config or {}
+
+        def __call__(self, value):
+            return value
+
+    class SelectSelectorMode(str, enum.Enum):
+        LIST = "list"
+        DROPDOWN = "dropdown"
+
     ha_selector.EntitySelector = _FakeEntitySelector
+    ha_selector.SelectSelector = _FakeSelectSelector
+    ha_selector.SelectSelectorMode = SelectSelectorMode
 
     ha_helpers = types.ModuleType("homeassistant.helpers")
     ha_helpers.entity = ha_entity

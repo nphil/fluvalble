@@ -501,7 +501,14 @@ def test_hold_attributes_track_drops_and_reconnect_progress():
     device = _holding_device()
     attributes = device.connection_hold_attributes()
 
-    assert attributes == {"hold": True, "drops_1h": 0, "last_drop": None, "reconnect_attempt": 0}
+    assert attributes == {
+        "hold": True,
+        "drops_1h": 0,
+        "last_drop": None,
+        "reconnect_attempt": 0,
+        "preferred_proxy": "",
+        "via_preferred_proxy": False,
+    }
 
     device.hold_stats.record_drop()
     device.hold_stats.record_reconnect_attempt(3)

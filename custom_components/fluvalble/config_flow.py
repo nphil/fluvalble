@@ -23,6 +23,7 @@ except ImportError:  # Home Assistant before 2025.8
 from homeassistant.const import CONF_MAC
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import selector
 from homeassistant.helpers.device_registry import format_mac
 
 from .core import (
@@ -34,6 +35,7 @@ from .core import (
     CONF_LAMP_PROFILE,
     CONF_OVERRIDE_RETURN_MIN,
     CONF_PING_INTERVAL,
+    CONF_PREFERRED_PROXY,
     DEFAULT_ACTIVE_TIME,
     DEFAULT_ALERT_AFTER_FAILURES,
     DEFAULT_CHECK_INTERVAL_MIN,
@@ -41,6 +43,7 @@ from .core import (
     DEFAULT_LAMP_PROFILE,
     DEFAULT_OVERRIDE_RETURN_MIN,
     DEFAULT_PING_INTERVAL,
+    DEFAULT_PREFERRED_PROXY,
     DOMAIN,
     EXPECTED_MODE_AUTO,
     EXPECTED_MODE_MANUAL,
@@ -84,50 +87,79 @@ def validate_active_time(value: Any) -> int:
     raise vol.Invalid("Active connection window must be 0 or between 30 and 600 seconds")
 
 
-OPTIONS_SCHEMA = vol.Schema(
-    {
-        vol.Optional(CONF_LAMP_PROFILE, default=DEFAULT_LAMP_PROFILE): vol.In(
-            {
-                LAMP_PROFILE_AUTO: "Auto-detect (APK product ID first)",
-                LAMP_PROFILE_PLANT: "Plant 5-channel (Pink–Warm White)",
-                LAMP_PROFILE_PLANT_PRO: "Current Plant 5-channel (Pink–Warm White)",
-                LAMP_PROFILE_MARINE: "Marine/Reef 5-channel spectrum",
-                LAMP_PROFILE_AQUASKY: "AquaSky 2.0 (4-channel RGBW)",
-                LAMP_PROFILE_AQUASKY3: "AquaSky 3.0 / FACEBD (4-channel RGBW)",
-            }
-        ),
-        vol.Optional(CONF_PING_INTERVAL, default=DEFAULT_PING_INTERVAL): vol.All(
-            int,
-            vol.Range(min=5, max=60),
-        ),
-        # Keep the form schema serializable by Home Assistant. The 1-29 gap is
-        # enforced explicitly in the options step below.
-        vol.Optional(CONF_ACTIVE_TIME, default=DEFAULT_ACTIVE_TIME): vol.All(
-            int,
-            vol.Range(min=0, max=600),
-        ),
-        vol.Optional(CONF_EXPECTED_MODE, default=DEFAULT_EXPECTED_MODE): vol.In(
-            {
-                EXPECTED_MODE_AUTO: "Auto - keep the fixture on its onboard Auto schedule",
-                EXPECTED_MODE_PRO: "Professional - keep the fixture on its onboard Professional schedule",
-                EXPECTED_MODE_MANUAL: "Manual - keep the fixture in Manual mode",
-                EXPECTED_MODE_UNSUPERVISED: "Unsupervised - report status only, never correct mode or schedule",
-            }
-        ),
-        vol.Optional(CONF_CHECK_INTERVAL_MIN, default=DEFAULT_CHECK_INTERVAL_MIN): vol.All(
-            int,
-            vol.Range(min=1, max=1440),
-        ),
-        vol.Optional(CONF_OVERRIDE_RETURN_MIN, default=DEFAULT_OVERRIDE_RETURN_MIN): vol.All(
-            int,
-            vol.Range(min=0, max=1440),
-        ),
-        vol.Optional(CONF_ALERT_AFTER_FAILURES, default=DEFAULT_ALERT_AFTER_FAILURES): vol.All(
-            int,
-            vol.Range(min=1, max=20),
-        ),
+def _preferred_proxy_options(hass: HomeAssistant, current: str) -> list[str]:
+    """List selectable BLE proxy node names for the preferred-proxy dropdown.
+
+    "" is the leading Automatic choice (labelled via translations). A proxy
+    that is currently configured but not advertising this session stays in
+    the list so redisplaying/saving the form never silently drops it; the
+    selector's `custom_value` also lets the operator type one that has never
+    been seen yet (e.g. before its ESPHome device connects for the first time).
+    """
+    scanners = {
+        scanner.adapter
+        for scanner in bluetooth.async_current_scanners(hass)
+        if scanner.connectable and getattr(scanner, "adapter", None)
     }
-)
+    if current:
+        scanners.add(current)
+    return ["", *sorted(scanners)]
+
+
+def _options_schema(hass: HomeAssistant, current_preferred_proxy: str) -> vol.Schema:
+    """Build the options form schema, including the live BLE-proxy dropdown."""
+    return vol.Schema(
+        {
+            vol.Optional(CONF_LAMP_PROFILE, default=DEFAULT_LAMP_PROFILE): vol.In(
+                {
+                    LAMP_PROFILE_AUTO: "Auto-detect (APK product ID first)",
+                    LAMP_PROFILE_PLANT: "Plant 5-channel (Pink–Warm White)",
+                    LAMP_PROFILE_PLANT_PRO: "Current Plant 5-channel (Pink–Warm White)",
+                    LAMP_PROFILE_MARINE: "Marine/Reef 5-channel spectrum",
+                    LAMP_PROFILE_AQUASKY: "AquaSky 2.0 (4-channel RGBW)",
+                    LAMP_PROFILE_AQUASKY3: "AquaSky 3.0 / FACEBD (4-channel RGBW)",
+                }
+            ),
+            vol.Optional(CONF_PING_INTERVAL, default=DEFAULT_PING_INTERVAL): vol.All(
+                int,
+                vol.Range(min=5, max=60),
+            ),
+            # Keep the form schema serializable by Home Assistant. The 1-29 gap is
+            # enforced explicitly in the options step below.
+            vol.Optional(CONF_ACTIVE_TIME, default=DEFAULT_ACTIVE_TIME): vol.All(
+                int,
+                vol.Range(min=0, max=600),
+            ),
+            vol.Optional(CONF_PREFERRED_PROXY, default=DEFAULT_PREFERRED_PROXY): selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=_preferred_proxy_options(hass, current_preferred_proxy),
+                    mode=selector.SelectSelectorMode.DROPDOWN,
+                    custom_value=True,
+                    translation_key=CONF_PREFERRED_PROXY,
+                )
+            ),
+            vol.Optional(CONF_EXPECTED_MODE, default=DEFAULT_EXPECTED_MODE): vol.In(
+                {
+                    EXPECTED_MODE_AUTO: "Auto - keep the fixture on its onboard Auto schedule",
+                    EXPECTED_MODE_PRO: "Professional - keep the fixture on its onboard Professional schedule",
+                    EXPECTED_MODE_MANUAL: "Manual - keep the fixture in Manual mode",
+                    EXPECTED_MODE_UNSUPERVISED: "Unsupervised - report status only, never correct mode or schedule",
+                }
+            ),
+            vol.Optional(CONF_CHECK_INTERVAL_MIN, default=DEFAULT_CHECK_INTERVAL_MIN): vol.All(
+                int,
+                vol.Range(min=1, max=1440),
+            ),
+            vol.Optional(CONF_OVERRIDE_RETURN_MIN, default=DEFAULT_OVERRIDE_RETURN_MIN): vol.All(
+                int,
+                vol.Range(min=0, max=1440),
+            ),
+            vol.Optional(CONF_ALERT_AFTER_FAILURES, default=DEFAULT_ALERT_AFTER_FAILURES): vol.All(
+                int,
+                vol.Range(min=1, max=20),
+            ),
+        }
+    )
 
 
 def normalize_mac(mac: str) -> str:
@@ -451,7 +483,7 @@ class OptionsFlowHandler(OptionsFlowBase):
                 return self.async_show_form(
                     step_id="init",
                     data_schema=self.add_suggested_values_to_schema(
-                        OPTIONS_SCHEMA,
+                        _options_schema(self.hass, user_input.get(CONF_PREFERRED_PROXY, DEFAULT_PREFERRED_PROXY)),
                         user_input,
                     ),
                     errors={CONF_ACTIVE_TIME: "invalid_active_time"},
@@ -465,11 +497,12 @@ class OptionsFlowHandler(OptionsFlowBase):
             merged = {**self._config_entry().options, **user_input}
             return self.async_create_entry(title="", data=merged)
 
+        entry_options = self._config_entry().options
         return self.async_show_form(
             step_id="init",
             data_schema=self.add_suggested_values_to_schema(
-                OPTIONS_SCHEMA,
-                self._config_entry().options,
+                _options_schema(self.hass, entry_options.get(CONF_PREFERRED_PROXY, DEFAULT_PREFERRED_PROXY)),
+                entry_options,
             ),
         )
 

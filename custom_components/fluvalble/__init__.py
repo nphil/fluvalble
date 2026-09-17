@@ -32,6 +32,7 @@ from .core import (
     CONF_EXPECTED_SCHEDULE,
     CONF_LAST_HOLDING_PROXY,
     CONF_PING_INTERVAL,
+    CONF_PREFERRED_PROXY,
     CONF_RECOVERY_OUTLET,
     DEFAULT_ACTIVE_TIME,
     DEFAULT_PING_INTERVAL,
@@ -585,6 +586,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: FluvalConfigEntry) -> bo
             config_data={**dict(entry.data), **dict(entry.options)},
             ping_interval=ping_interval,
             active_time=active_time,
+            # Read live so an options change takes effect on the next
+            # reconnect - in practice immediate, since a preferred_proxy
+            # change reloads the entry and rebuilds this Device anyway.
+            preferred_getter=lambda: entry.options.get(CONF_PREFERRED_PROXY) or None,
         )
         device.entry_id = entry.entry_id
         runtime.device = device
@@ -1689,10 +1694,14 @@ async def async_remove_entry(hass: HomeAssistant, entry: FluvalConfigEntry) -> N
 # slots free (measured 2026-09-09/10: an HA restart wedged three devices; only
 # rebooting the proxy holding each stale link freed them).
 #
-# The proxies now release their links themselves 25 s after losing their API
-# client, which covers every way HA can vanish including a crash or a power
-# cut. This action is the cooperative path for the case HA *is* still running:
-# it releases the link before the restart rather than during it. Implemented by
+# Nothing on the proxy side covers this any more: ESPHome 2026.09.14 removed the
+# on-API-loss release hook, and rebooting a proxy is not a cure either - it
+# re-rolls the dice (2026-09-17: 2 of 6 proxies re-ghosted on their first
+# post-reboot connection). The only clean path is to drop the link while HA and
+# its Bluetooth stack are both still alive, which is what this action does:
+# `script.safe_restart` calls it on every BLE integration and only then restarts
+# Core. A ghost that forms anyway is caught by `automation.ble_ghost_link_detector`
+# and freed with the holding proxy's `force_disconnect_orphan` action. Implemented by
 # unloading the entry, because async_unload_entry is this integration's proven release path: it stops the
 # guardian, the hold supervisor and the client, which best-effort disconnects.
 # Reaching into the client directly would race the ping loop, which reconnects.
