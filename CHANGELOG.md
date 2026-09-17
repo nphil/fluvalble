@@ -5,7 +5,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
-## [Unreleased]
+## [1.4.0]
+
+### Added
+- New option **Preferred proxy**: pin the fixture's BLE link to one ESPHome proxy (normally the one in its room) instead of letting Home Assistant pick by signal strength on every connect. Home Assistant's own selection ignores the device an integration hands it and re-scores every route each time, which is how a fixture ends up carried by a proxy two rooms away; every ghost link observed between 2026-09-09 and 2026-09-17 formed on exactly such a marginal long link, where the disconnect handshake fails to complete and leaves the fixture believing it is still connected. Fallback is bounded and automatic: if the preferred proxy is not currently advertising the fixture, has no free connection slot, or has failed the last three attempts in a row, the default selection runs unchanged, and the preference applies again as soon as that proxy succeeds. Leaving the option empty keeps the previous behaviour. The Connection sensor reports `preferred_proxy` and `via_preferred_proxy` so it is visible which path a live link actually took.
+
+## [1.3.0]
 
 ### Added
 - New repair `<mac>_unreachable`, raised once Home Assistant has been unable to hold a BLE link to the fixture for 15 minutes and deleted the moment the link returns. Both this and the existing schedule-problem repair are now fixable: the **Fix** button opens a recovery wizard that escalates from checking again, through reloading the integration and restarting the ESPHome proxy that was carrying the link, to cutting and restoring mains power through a switch you pick (remembered in the entry's options for next time). A schedule problem starts one rung earlier by re-pushing the expected mode and schedule through the guardian. The proxy restart is only offered when a proxy is known and exposes the matching `esphome` action, and is reported honestly - the proxy firmware refuses a restart while its own uptime is under 20 minutes, so the wizard never claims a reboot it cannot confirm.
