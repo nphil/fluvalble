@@ -447,6 +447,9 @@ class Device:
         self.client: Client | None = None
         self._ping_interval = ping_interval
         self._active_time = active_time
+        # True while `async_reset_connection` is tearing a client down, so an
+        # advertisement arriving mid-teardown cannot re-arm the hold on top of it.
+        self._resetting = False
         # Reads the live `preferred_proxy` option on every connect (see
         # `_affinity_client_class`); defaults to "always automatic" for
         # callers (mostly tests) that construct a Device with no getter.
@@ -692,22 +695,31 @@ class Device:
                 self._release_priority_slot()
 
     async def async_reset_connection(self) -> None:
-        """Discard the current Client so the next command reconnects from scratch.
+        """Discard the current Client so the next connect starts from scratch.
 
-        Called after a command's `command_transaction` deadline expires:
-        bounding the stuck await stopped the *hang*, but the underlying
-        BleakClient may still be sitting mid-write with an adapter or proxy
-        that still considers the slot in use. Stopping it outright (rather
-        than trying to keep using it) is the only way to guarantee the next
-        command starts from a known-good state; `Client.stop()` already
-        best-effort disconnects and tears down its own background tasks, and
-        its status callback (`Device.set_connected(False)`) resets clock-sync
-        state the same way a real disconnect does.
+        Called after a command's `command_transaction` deadline expires (and by
+        the guardian when a check step times out): bounding the stuck await
+        stopped the *hang*, but the underlying BleakClient may still be sitting
+        mid-write with an adapter or proxy that still considers the slot in
+        use. Stopping it outright is the only way to guarantee a known-good
+        state; `Client.stop()` best-effort disconnects and tears down its own
+        background tasks - including, in hold mode, the reconnect supervisor.
+
+        That last part is why this is not the end of the story for a held
+        link: with the supervisor gone and no Client left, nothing reconnects.
+        Observed 2026-09-24: a guardian clock sync timed out during a
+        reconnect attempt at 17:49, this reset ran, and the Fluval made no
+        further attempt for hours. `update_ble` therefore re-arms the hold on
+        the next advertisement once this reset has finished.
         """
-        client, self.client = self.client, None
-        if client is not None:
-            with contextlib.suppress(Exception):
-                await client.stop()
+        self._resetting = True
+        try:
+            client, self.client = self.client, None
+            if client is not None:
+                with contextlib.suppress(Exception):
+                    await client.stop()
+        finally:
+            self._resetting = False
 
     def touch_seen(self, *, rssi: int | None = None, notify: bool = True) -> None:
         """Record successful advertisement, connection, or command activity."""
@@ -861,6 +873,14 @@ class Device:
             # (`_async_ensure_client()`) - so an idle install never grabs the
             # single GATT slot on its own.
             self.client.device = device
+        elif self.hold_active and not self._resetting:
+            # Hold mode is a promise to keep the link up, and an advertisement
+            # proves the fixture is reachable. A held device with no Client
+            # means something discarded it (see `async_reset_connection`), and
+            # with it the reconnect supervisor - so re-arm here. Constructing a
+            # Client starts its connect + supervisor; once it exists this branch
+            # is never taken again, so advertisements cannot stack attempts.
+            self.client = self._new_client(device)
 
         self._notify_diagnostics_throttled()
         for handler in self.updates_component:

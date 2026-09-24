@@ -5,6 +5,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.4.1]
+
+### Fixed
+- **A held link no longer dies permanently after a timed-out check.** When a guardian check (or any command) hit its deadline, `async_reset_connection()` stopped the Client - and with it the reconnect supervisor - leaving no Client at all. `update_ble` deliberately never creates one, so a fixture in hold mode (`active_time == 0`) made no further connection attempt until a user command happened to run, even while it kept advertising. Observed 2026-09-24: a clock sync timed out mid-reconnect at 17:49 and the light stayed disconnected for hours with no attempt logged. In hold mode an advertisement now re-arms the hold once (never once per advertisement, and never while a reset is still tearing down); idle installs are unchanged.
+
+---
+
 ## [1.4.0]
 
 ### Added

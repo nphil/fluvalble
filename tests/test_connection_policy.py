@@ -134,6 +134,50 @@ def test_update_ble_never_creates_a_client():
     assert device.client is None
 
 
+def test_update_ble_re_arms_a_held_link_that_a_reset_discarded():
+    """Hold mode must survive `async_reset_connection`.
+
+    2026-09-24: a guardian clock sync timed out mid-reconnect, the reset
+    stopped the Client (and with it the reconnect supervisor), and the Fluval
+    made no further attempt for hours while it kept advertising.
+    """
+    device = _holding_device(active_time=0)
+    old = SimpleNamespace(stop=AsyncMock())
+    device.client = old
+    _run(device.async_reset_connection())
+    assert device.client is None
+    old.stop.assert_awaited_once()
+
+    fresh = SimpleNamespace(device=None)
+    with patch.object(Device, "_new_client", return_value=fresh) as new_client:
+        device.update_ble(_ble_device(), _advertisement(), "esphome_proxy")
+        device.update_ble(_ble_device(), _advertisement(rssi=-70), "esphome_proxy")
+
+    assert device.client is fresh
+    new_client.assert_called_once()  # one re-arm, never one per advertisement
+    assert fresh.device is not None  # later adverts just refresh the live client's route
+
+
+def test_update_ble_does_not_re_arm_while_a_reset_is_tearing_down():
+    device = _holding_device(active_time=0)
+    device._resetting = True
+
+    with patch.object(Device, "_new_client") as new_client:
+        device.update_ble(_ble_device(), _advertisement(), "esphome_proxy")
+
+    new_client.assert_not_called()
+    assert device.client is None
+
+
+def test_update_ble_still_never_creates_a_client_for_an_idle_install():
+    device = _holding_device(active_time=120)
+
+    with patch.object(Device, "_new_client") as new_client:
+        device.update_ble(_ble_device(), _advertisement(), "esphome_proxy")
+
+    new_client.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Classic-protocol clock sync precedes the first status read, every connect
 # ---------------------------------------------------------------------------
