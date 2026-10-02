@@ -1871,8 +1871,8 @@ async def async_remove_entry(hass: HomeAssistant, entry: FluvalConfigEntry) -> N
 # nothing here may infer "shutting down" from the core state; the job latches
 # the entry (and the process, via SHUTTING_DOWN) closed instead.
 #
-# `release_link` stays as the manual path (`script.safe_restart` still calls it
-# until the shutdown job is proven). It is implemented by unloading the entry,
+# `release_link` stays as the manual path (e.g. `script.ble_restart_proxy`
+# calls it before a proxy reboot). It is implemented by unloading the entry,
 # because async_unload_entry is this integration's proven release path: it
 # stops the guardian, the hold supervisor and the client, which best-effort
 # disconnects. Reaching into the client directly would race the ping loop,
