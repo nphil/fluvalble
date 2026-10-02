@@ -117,6 +117,15 @@ def _stub_homeassistant():
     ha_core.CoreState = enum.Enum("CoreState", {"running": "running"})
     ha_core.HomeAssistant = MagicMock
     ha_core.ServiceCall = MagicMock
+
+    class _HassJob:
+        """Stand-in for homeassistant.core.HassJob: keeps target and name."""
+
+        def __init__(self, target, name=None):
+            self.target = target
+            self.name = name
+
+    ha_core.HassJob = _HassJob
     def _callback(f):  # mirrors homeassistant.core.callback: mark for loop dispatch
         f._hass_callback = True
         return f

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 import contextlib
 import inspect
 import logging
@@ -19,7 +20,7 @@ from homeassistant.components import bluetooth
 from homeassistant.components import websocket_api
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import ATTR_DEVICE_ID, CONF_MAC, EVENT_HOMEASSISTANT_STARTED, Platform
-from homeassistant.core import CoreState, HomeAssistant, ServiceCall, callback
+from homeassistant.core import CoreState, HassJob, HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import issue_registry as ir
@@ -80,6 +81,9 @@ class FluvalRuntimeData:
     # link watcher and the fix flow write themselves - see
     # _async_update_listener for why the difference matters.
     setup_options: dict[str, Any] = field(default_factory=dict, repr=False)
+    # Set by the Stage-1 shutdown job before it touches the link. Never
+    # cleared: a reload builds a new FluvalRuntimeData.
+    closing: bool = False
 
 
 try:
@@ -219,6 +223,13 @@ SERVICE_END_OVERRIDE = "end_override"
 SERVICES_REGISTERED = "services_registered"
 STATIC_REGISTERED = "static_registered"
 WEBSOCKET_REGISTERED = "websocket_registered"
+# hass.data[DOMAIN] key, set (never cleared) once any entry's shutdown job has
+# latched the process closed. Outlives every entry unload.
+SHUTTING_DOWN = "shutting_down"
+# Seconds the Stage-1 shutdown job may spend dropping one entry's link. Core
+# gives all shutdown jobs one shared 20 s budget; this keeps one stuck
+# disconnect from using all of it.
+RELEASE_AT_SHUTDOWN_TIMEOUT = 8
 STATIC_URL = "/fluvalble"
 STORAGE_KEY = "fluvalble_schedules"
 STORAGE_VERSION = 1
@@ -549,6 +560,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: FluvalConfigEntry) -> bo
     # completes and the watcher counts down from the first drop the process
     # recorded, which this reload did not reset (core/recovery docstring).
     runtime.link_watcher = async_setup_link_watcher(hass, entry, mac)
+    _async_register_shutdown_release(hass, entry, runtime)
     last_discovery_log = 0.0
 
     def create_runtime_task(coroutine) -> asyncio.Task:
@@ -661,6 +673,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: FluvalConfigEntry) -> bo
         change: bluetooth.BluetoothChange,
     ) -> None:
         log_discovery_update("Fluval BLE update: %s %s", service_info, change)
+        if runtime.closing:
+            # Shutting down: keep the latch closed - no Device may be built
+            # (its hold would connect) and no advertisement may re-arm one.
+            return
         if device := runtime.device:
             device.update_ble(
                 service_info.device,
@@ -1661,6 +1677,84 @@ async def async_unload_entry(hass: HomeAssistant, entry: FluvalConfigEntry) -> b
     return True
 
 
+def _domain_shutting_down(hass: HomeAssistant) -> bool:
+    """Return whether any entry has begun releasing its link for shutdown.
+
+    Process-lifetime on purpose: it outlives every config-entry unload, so a
+    resume timer left behind by `release_link` can still see it.
+    """
+    return hass.data.get(DOMAIN, {}).get(SHUTTING_DOWN) is True
+
+
+async def _async_release_link_at_shutdown(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    runtime: FluvalRuntimeData,
+) -> None:
+    """Drop this entry's open Bluetooth link, held or transient, and stay closed.
+
+    Runs as a Stage-1 shutdown job (see the release_link notes above), so the
+    Bluetooth stack and the proxies are still alive. Order matters:
+
+    1. Latch first - nothing may open a connection from here on (the Device
+       refuses commands, guardian checks, the hold supervisor and
+       advertisement re-arming; a Device created later is born closed).
+    2. Quiet the watchers, as `async_unload_entry` does, so the deliberate
+       disconnect is neither counted as an outage nor turned into a repair.
+       The issue registry is persisted at final write, so nothing may be
+       created or deleted here.
+    3. Release the link, bounded to RELEASE_AT_SHUTDOWN_TIMEOUT.
+
+    The entry is deliberately NOT unloaded: entities stay, restore-state
+    stays, and no wave of `unavailable` states is written. Never raises.
+    """
+    started = monotonic()
+    try:
+        runtime.closing = True
+        hass.data.setdefault(DOMAIN, {})[SHUTTING_DOWN] = True
+        if runtime.device is not None:
+            runtime.device.closing = True
+        if runtime.link_watcher is not None:
+            runtime.link_watcher.stop()
+        for task in list(runtime.background_tasks):
+            task.cancel()
+        if runtime.device is not None:
+            async with asyncio.timeout(RELEASE_AT_SHUTDOWN_TIMEOUT):
+                await runtime.device.async_release_for_shutdown()
+    except TimeoutError:
+        _LOGGER.warning(
+            "Releasing the BLE link to %s at shutdown timed out after %s s; the link may be left open",
+            entry.title,
+            RELEASE_AT_SHUTDOWN_TIMEOUT,
+        )
+    except Exception:  # noqa: BLE001 - a shutdown job must never raise
+        _LOGGER.warning("Releasing the BLE link to %s at shutdown failed", entry.title, exc_info=True)
+    else:
+        _LOGGER.info("Released BLE link to %s at shutdown in %.2f s", entry.title, monotonic() - started)
+
+
+@callback
+def _async_register_shutdown_release(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    runtime: FluvalRuntimeData,
+) -> None:
+    """Register this entry's one Stage-1 shutdown job; removed again on unload.
+
+    Per entry rather than one domain-wide loop: core gathers the jobs, so
+    they run in parallel and a slow device cannot starve the others.
+    """
+
+    async def _async_release_at_shutdown() -> None:
+        await _async_release_link_at_shutdown(hass, entry, runtime)
+
+    entry.async_on_unload(
+        hass.async_add_shutdown_job(
+            HassJob(_async_release_at_shutdown, f"fluvalble release BLE link {entry.title}")
+        )
+    )
+
+
 async def async_remove_entry(hass: HomeAssistant, entry: FluvalConfigEntry) -> None:
     """Clean up integration-owned state that outlives a normal unload.
 
@@ -1683,32 +1777,39 @@ async def async_remove_entry(hass: HomeAssistant, entry: FluvalConfigEntry) -> N
 
 
 # ---------------------------------------------------------------------------
-# release_link - clean teardown before Home Assistant goes away
+# Releasing the Bluetooth link before Home Assistant goes away
 # ---------------------------------------------------------------------------
 #
-# Home Assistant does NOT unload config entries on shutdown: it fires
-# EVENT_HOMEASSISTANT_STOP and the `bluetooth` integration tears its stack down
-# concurrently, so held GATT links die without a completed disconnect. The
-# peripheral keeps believing it is connected, stops advertising, and answers
-# nobody - a ghost link Home Assistant cannot see because the proxy reports its
-# slots free (measured 2026-09-09/10: an HA restart wedged three devices; only
-# rebooting the proxy holding each stale link freed them).
+# Home Assistant does NOT unload config entries on shutdown, and the `bluetooth`
+# integration tears its stack down on EVENT_HOMEASSISTANT_STOP. A listener on
+# that event loses the race: held GATT links die without a completed
+# disconnect, the peripheral keeps believing it is connected, stops
+# advertising, and answers nobody - a ghost link Home Assistant cannot see
+# because the proxy reports its slots free (measured 2026-09-09/10: an HA
+# restart wedged three devices; only rebooting the proxy holding each stale
+# link freed them).
 #
-# Nothing on the proxy side covers this any more: ESPHome 2026.09.14 removed the
-# on-API-loss release hook, and rebooting a proxy is not a cure either - it
-# re-rolls the dice (2026-09-17: 2 of 6 proxies re-ghosted on their first
-# post-reboot connection). The only clean path is to drop the link while HA and
-# its Bluetooth stack are both still alive, which is what this action does:
-# `script.safe_restart` calls it on every BLE integration and only then restarts
-# Core. A ghost that forms anyway is caught by `automation.ble_ghost_link_detector`
-# and freed with the holding proxy's `force_disconnect_orphan` action. Implemented by
-# unloading the entry, because async_unload_entry is this integration's proven release path: it stops the
-# guardian, the hold supervisor and the client, which best-effort disconnects.
-# Reaching into the client directly would race the ping loop, which reconnects.
+# Core's `async_stop` runs "Stage 1" shutdown jobs (`async_add_shutdown_job`)
+# BEFORE it fires EVENT_HOMEASSISTANT_STOP, all concurrently under one 20 s
+# budget. The bluetooth stack and the ESPHome proxy connections are still
+# alive then, so each entry registers one such job (see
+# `_async_register_shutdown_release`) that drops whatever link is open -
+# held or transient. Core is still `CoreState.running` during Stage 1, so
+# nothing here may infer "shutting down" from the core state; the job latches
+# the entry (and the process, via SHUTTING_DOWN) closed instead.
+#
+# `release_link` stays as the manual path (`script.safe_restart` still calls it
+# until the shutdown job is proven). It is implemented by unloading the entry,
+# because async_unload_entry is this integration's proven release path: it
+# stops the guardian, the hold supervisor and the client, which best-effort
+# disconnects. Reaching into the client directly would race the ping loop,
+# which reconnects.
 #
 # `resume_after` sets the entry up again if no restart follows, so an operator
 # who calls this and changes their mind is not left with a dead device that
-# would raise its own unreachable repair a quarter of an hour later.
+# would raise its own unreachable repair a quarter of an hour later. That
+# timer is cancelled by a shutdown job of its own: an entry set up again
+# during shutdown would open a link nothing is left to release.
 SERVICE_RELEASE_LINK = "release_link"
 ATTR_RESUME_AFTER = "resume_after"
 DEFAULT_RESUME_AFTER = 180
@@ -1733,10 +1834,16 @@ async def _async_release_links(hass: HomeAssistant, resume_after: int) -> None:
             await hass.config_entries.async_unload(entry.entry_id)
         _LOGGER.info("Released the Bluetooth link held for %s", entry.title)
 
-    if not released or resume_after <= 0:
+    if not released or resume_after <= 0 or _domain_shutting_down(hass):
         return
 
+    remove_shutdown_job: Callable[[], None] | None = None
+
     async def _resume(_now: Any) -> None:
+        if remove_shutdown_job is not None:
+            remove_shutdown_job()
+        if _domain_shutting_down(hass):
+            return
         for entry in released:
             if entry.state is ConfigEntryState.LOADED:
                 continue  # something set it up already; it owns itself now
@@ -1747,7 +1854,16 @@ async def _async_release_links(hass: HomeAssistant, resume_after: int) -> None:
             resume_after,
         )
 
-    async_call_later(hass, resume_after, _resume)
+    cancel_resume = async_call_later(hass, resume_after, _resume)
+
+    @callback
+    def _cancel_resume_at_shutdown() -> None:
+        hass.data.setdefault(DOMAIN, {})[SHUTTING_DOWN] = True
+        cancel_resume()
+
+    remove_shutdown_job = hass.async_add_shutdown_job(
+        HassJob(_cancel_resume_at_shutdown, "fluvalble cancel release_link resume")
+    )
 
 
 @callback

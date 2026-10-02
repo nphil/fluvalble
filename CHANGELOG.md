@@ -5,6 +5,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.5.0]
+
+### Changed
+- **The Bluetooth link is released by a Home Assistant Stage-1 shutdown job.** Core's `async_stop` runs jobs registered with `async_add_shutdown_job` before it fires `EVENT_HOMEASSISTANT_STOP` (all concurrently, one shared 20 s budget), while the `bluetooth` stack and the ESPHome proxy connections are still alive; a listener on the stop event loses the race with the stack's own teardown, which is how a restart leaves a peripheral on a ghost link. Each config entry now registers one such job that releases whatever link is open - held (`hold_connection`) or transient (guardian check, ping, command) - without unloading the entry or removing entities. Order: latch, quiet the unreachable countdown, release (bounded to 8 s, never raises, one INFO line on success and one WARNING on timeout/error). The latch (`Device.closing`, `FluvalRuntimeData.closing`, process-wide `hass.data[fluvalble][shutting_down]`) is never cleared and makes commands, guardian checks and their repair updates, the held-link supervisor, advertisement re-arming and `release_link` resume timers refuse to connect. `release_link` is unchanged; its resume timer is now cancelled by its own shutdown job. Core is still `CoreState.running` during Stage 1, so nothing infers shutdown from the core state.
+- A stopped link watcher now ignores late notifications instead of re-arming its countdown.
+
+---
+
 ## [1.4.1]
 
 ### Fixed

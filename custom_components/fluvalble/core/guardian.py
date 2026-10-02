@@ -271,7 +271,13 @@ class ScheduleGuardian:
         interval timer, a connect event, the "check now" service) and
         `async_end_override` all queue behind that same lock.
         """
+        if self._device_closing():
+            # Shutting down: no check may connect, and a refused check is not
+            # a failure - leave the recorded status and streaks untouched.
+            return self.status
         async with self._check_lock:
+            if self._device_closing():
+                return self.status
             try:
                 async with asyncio.timeout(CHECK_OVERALL_TIMEOUT):
                     return await self._async_check_locked()
@@ -284,6 +290,14 @@ class ScheduleGuardian:
                 )
                 await self._async_reset_connection_quiet()
                 return self._finish(STATUS_UNREACHABLE)
+
+    def _device_closing(self) -> bool:
+        """Return whether the device has been latched closed for shutdown.
+
+        Strict `is True` so a device double without the attribute (or a
+        mock that fabricates one) never reads as closing.
+        """
+        return getattr(self.device, "closing", False) is True
 
     def _priority_pending(self) -> bool:
         """Return whether a user-initiated command wants the device right now.
@@ -523,6 +537,10 @@ class ScheduleGuardian:
             await self.device.async_reset_connection()
 
     def _finish(self, status: str) -> str:
+        if self._device_closing():
+            # A check cut short by the shutdown latch saw refused commands,
+            # not a fixture fault: record nothing and raise no alert.
+            return self.status
         if status == STATUS_DEFERRED:
             # A deferred check never reached the fixture, so it must neither
             # count as a failure nor clear an existing failure streak - a
@@ -573,6 +591,8 @@ class ScheduleGuardian:
         # runs inline on the event loop, where creating the task is legal.
         @callback
         def _run_check_soon(*_args: Any) -> None:
+            if self._device_closing():
+                return
             if self._check_lock.locked():
                 # A check is already running (bounded by its own
                 # CHECK_OVERALL_TIMEOUT) - queuing another behind the same

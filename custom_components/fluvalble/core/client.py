@@ -1030,8 +1030,15 @@ class Client:
         """Disconnect from the Fluval while keeping this client reusable."""
         await self._async_disconnect(final=False)
 
-    async def _async_disconnect(self, *, final: bool) -> None:
-        """Disconnect and optionally prevent this client from being reused."""
+    async def _async_disconnect(self, *, final: bool, stop_notify: bool = True) -> None:
+        """Disconnect and optionally prevent this client from being reused.
+
+        `stop_notify=False` skips the per-characteristic unsubscribe before a
+        final disconnect. The shutdown release uses it: dropping the link is
+        what matters there, the peripheral discards its subscriptions with
+        it, and every unsubscribe is a GATT round trip spent out of a
+        bounded budget.
+        """
         self._stopping = True
         self.ping_time = 0
 
@@ -1050,7 +1057,7 @@ class Client:
                 await asyncio.wait_for(self.connect_task, timeout=3)
             self.connect_task = None
 
-        if final and self.client is not None:
+        if final and stop_notify and self.client is not None:
             for uuid in self.notify_uuids:
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(self.client.stop_notify(uuid), timeout=2)
@@ -1061,9 +1068,9 @@ class Client:
         if not final:
             self._stopping = False
 
-    async def stop(self):
+    async def stop(self, *, stop_notify: bool = True):
         """Permanently stop background work during integration unload."""
-        await self._async_disconnect(final=True)
+        await self._async_disconnect(final=True, stop_notify=stop_notify)
 
 
 def encrypt(data: bytearray) -> bytearray:

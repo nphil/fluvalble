@@ -182,6 +182,11 @@ def serialized_device_command(
                 call_deadline = deadline
             else:
                 call_deadline = USER_COMMAND_DEADLINE if call_priority else DEFAULT_COMMAND_DEADLINE
+            if self.closing:
+                # Home Assistant is shutting down and the link has been (or
+                # is being) released for good; a command would reconnect.
+                self._set_diagnostic_error("shutting_down", "Home Assistant is shutting down")
+                return cast(_R, False)
             try:
                 async with self.command_transaction(deadline=call_deadline, priority=call_priority):
                     return await fn(self, *args, **kwargs)
@@ -450,6 +455,11 @@ class Device:
         # True while `async_reset_connection` is tearing a client down, so an
         # advertisement arriving mid-teardown cannot re-arm the hold on top of it.
         self._resetting = False
+        # Process-lifetime latch set by `async_release_for_shutdown`. Once
+        # true, nothing in this Device opens a connection again: commands,
+        # guardian checks, the held-link supervisor and advertisement
+        # re-arming all refuse. Never cleared - a reload builds a new Device.
+        self.closing = False
         # Reads the live `preferred_proxy` option on every connect (see
         # `_affinity_client_class`); defaults to "always automatic" for
         # callers (mostly tests) that construct a Device with no getter.
@@ -721,6 +731,33 @@ class Device:
         finally:
             self._resetting = False
 
+    async def async_release_for_shutdown(self) -> None:
+        """Latch this Device closed, then drop whatever GATT link is open.
+
+        Called from Home Assistant's Stage-1 shutdown job, while the
+        Bluetooth stack and the ESPHome proxies are still alive. The latch
+        comes first and is never cleared: from here on commands, guardian
+        checks, the held-link supervisor and advertisement re-arming all
+        refuse to connect, so nothing can reopen the link this method closes.
+
+        A software preview is only cancelled, never stopped through
+        `async_stop_preview`, because that restores the previous light state
+        with BLE writes. Does not unload anything and keeps the entities.
+        Any exception or cancellation is the caller's to bound and absorb.
+        """
+        self.closing = True
+        self.cancel_reachability_refresh()
+        preview_task = self.preview_task
+        if preview_task is not None:
+            preview_task.cancel()
+        self._resetting = True
+        try:
+            client, self.client = self.client, None
+            if client is not None:
+                await client.stop(stop_notify=False)
+        finally:
+            self._resetting = False
+
     def touch_seen(self, *, rssi: int | None = None, notify: bool = True) -> None:
         """Record successful advertisement, connection, or command activity."""
         self.conn_info["last_seen"] = datetime.now(UTC)
@@ -809,7 +846,7 @@ class Device:
 
     def _schedule_reachability_refresh(self) -> None:
         """Schedule a one-shot refresh at the recent-activity expiry."""
-        if self.hass is None or self.connected:
+        if self.hass is None or self.connected or self.closing:
             return
 
         self.cancel_reachability_refresh()
@@ -873,7 +910,7 @@ class Device:
             # (`_async_ensure_client()`) - so an idle install never grabs the
             # single GATT slot on its own.
             self.client.device = device
-        elif self.hold_active and not self._resetting:
+        elif self.hold_active and not self._resetting and not self.closing:
             # Hold mode is a promise to keep the link up, and an advertisement
             # proves the fixture is reachable. A held device with no Client
             # means something discarded it (see `async_reset_connection`), and
@@ -3169,7 +3206,7 @@ class Device:
         on demand instead of the fixture's single BLE slot being grabbed
         eagerly at startup.
         """
-        if not self.address:
+        if not self.address or self.closing:
             return False
 
         device = await self._async_find_device()

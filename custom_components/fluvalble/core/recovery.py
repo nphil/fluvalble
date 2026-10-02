@@ -260,6 +260,9 @@ class LinkWatcher:
         # Same reason FluvalEntity keeps one: deregistration has to hand
         # back the exact object that was registered.
         self._update_handler = self.reconcile
+        # Set by stop(); a stopped watcher never touches the countdown or the
+        # repair again, even if a late notification or attach() reaches it.
+        self._stopped = False
 
     def start(self) -> Callable[[], None]:
         """Reconcile once and return an unsubscribe callable."""
@@ -286,6 +289,7 @@ class LinkWatcher:
         measuring is not cancelled with it: the next watcher's start()
         re-arms for the time that is left, or raises at once if none is.
         """
+        self._stopped = True
         self._cancel_countdown()
         if self.device is not None:
             self.device.deregister_update("connection", self._update_handler)
@@ -299,6 +303,8 @@ class LinkWatcher:
         that comes back deletes the repair whether or not this process is
         the one that raised it.
         """
+        if self._stopped:
+            return
         if link_healthy(self.device):
             self._cancel_countdown()
             async_forget_link_outage(self.hass, self.mac)
