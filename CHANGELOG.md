@@ -5,6 +5,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.5.1]
+
+### Fixed
+- **Setup refuses while the shutdown latch is set.** Core reads the Stage-1 shutdown-job list once, so an entry set up after that (a reload, or a `release_link` resume timer) built a fresh `FluvalRuntimeData` with `closing=False` and its cached-advertisement path could open a held link that no job would ever release. `async_setup` now registers a domain-lifetime shutdown job (never removed on entry unload) that sets `hass.data[fluvalble][shutting_down]` and cancels every pending `release_link` resume timer; `async_setup_entry` raises `ConfigEntryNotReady` when it is set - at entry, after the static-path await, and (releasing, unloading platforms, then raising) after platform forwarding - and advertisement callbacks ignore it. The per-resume shutdown job added in 1.5.0 is gone, replaced by that domain job.
+- **A "Return to schedule" refused by the shutdown latch is not a fault.** `ScheduleGuardian.async_end_override` now checks the latch inside its lock and before recording a failed restore, so it no longer bumps `consecutive_failures`, sets `STATUS_FAILED`, or notifies listeners (which could raise a schedule-problem repair).
+
+---
+
 ## [1.5.0]
 
 ### Changed

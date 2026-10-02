@@ -418,7 +418,13 @@ class ScheduleGuardian:
         ``None``) if no override is currently active. Returns the resulting
         status string ("corrected"/"failed") otherwise.
         """
+        if self._device_closing():
+            return None
         async with self._check_lock:
+            if self._device_closing():
+                # Shutting down: a refused restore is not a fault - touch no
+                # counters, status or listeners, so no repair is raised.
+                return None
             if not self.override_active:
                 return None
 
@@ -429,6 +435,11 @@ class ScheduleGuardian:
                 return self.status
 
             ok = await self._try_ensure_mode(target_mode)
+            if not ok and self._device_closing():
+                # The latch closed while the restore was in flight (or refused
+                # it): a failure then says nothing about the fixture. Record
+                # nothing - no counter, no status, no repair.
+                return None
             if ok:
                 self._clear_override()
                 self.consecutive_failures = 0

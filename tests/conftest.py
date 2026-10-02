@@ -89,6 +89,7 @@ def _stub_homeassistant():
 
     ha_exc = types.ModuleType("homeassistant.exceptions")
     ha_exc.HomeAssistantError = HomeAssistantError
+    ha_exc.ConfigEntryNotReady = type("ConfigEntryNotReady", (HomeAssistantError,), {})
 
     # ---- homeassistant.const ----
     class Platform(str, enum.Enum):
@@ -354,6 +355,9 @@ def _stub_homeassistant():
     ha_selector.SelectSelectorMode = SelectSelectorMode
 
     ha_helpers = types.ModuleType("homeassistant.helpers")
+    ha_cv = types.ModuleType("homeassistant.helpers.config_validation")
+    ha_cv.config_entry_only_config_schema = lambda domain: {"config_entry_only": domain}
+    ha_helpers.config_validation = ha_cv
     ha_helpers.entity = ha_entity
     ha_helpers.device_registry = ha_dr
     ha_helpers.redact = ha_redact
@@ -521,6 +525,7 @@ def _stub_homeassistant():
         "homeassistant.components.number": ha_number,
         "homeassistant.components.sensor": ha_sensor,
         "homeassistant.components.select": ha_select,
+        "homeassistant.helpers.config_validation": ha_cv,
         "homeassistant.components.switch": ha_switch,
         "homeassistant.components.binary_sensor": ha_bs,
         "homeassistant.components.light": ha_light,

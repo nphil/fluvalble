@@ -315,10 +315,35 @@ def test_release_link_without_shutdown_still_unloads_and_resumes():
 
     hass.config_entries.async_unload.assert_awaited_once_with("entry_1")
     hass.config_entries.async_setup.assert_awaited_once_with("entry_1")
-    assert hass.jobs == []  # the resume timer's shutdown job is dropped once it fired
+    assert hass.data[DOMAIN][integration.RESUME_CANCELS] == {}  # a fired timer is forgotten
 
 
-def test_shutdown_cancels_a_pending_release_link_resume():
+# ---------------------------------------------------------------------------
+# Addendum A: domain-lifetime latch job
+# ---------------------------------------------------------------------------
+
+
+def test_async_setup_registers_one_domain_latch_job_that_survives_entry_unload():
+    hass = _FakeShutdownHass()
+    assert _run(integration.async_setup(hass, {})) is True
+
+    assert len(hass.jobs) == 1
+    job, _args = hass.jobs[0]
+    assert inspect.iscoroutinefunction(job.target) is False
+    assert getattr(job.target, "_hass_callback", False) is True  # runs on the loop, not an executor
+
+    # Entry unloads only remove their own jobs; the domain job stays.
+    entry = _FakeUnloadEntry()
+    _async_register_shutdown_release(hass, entry, FluvalRuntimeData())
+    for unload in entry.unload_callbacks:
+        unload()
+    assert len(hass.jobs) == 1
+
+    job.target()
+    assert _domain_shutting_down(hass)
+
+
+def test_domain_latch_job_cancels_pending_release_link_resume_timers_without_entry_jobs():
     entry = _loaded_entry()
     hass = _release_link_hass(entry)
     cancel = MagicMock()
@@ -328,18 +353,162 @@ def test_shutdown_cancels_a_pending_release_link_resume():
         timers["resume"] = callback
         return cancel
 
-    with patch.object(integration, "async_call_later", call_later):
-        _run(_async_release_links(hass, 180))
+    _run(integration.async_setup(hass, {}))
+    domain_job, _ = hass.jobs[0]
 
-    assert len(hass.jobs) == 1
-    job, _args = hass.jobs[0]
-    job.target()  # core runs the shutdown job
+    with patch.object(integration, "async_call_later", call_later):
+        _run(_async_release_links(hass, 180))  # unloads the entry: its own job is gone
+
+    domain_job.target()  # Stage 1 starts
 
     cancel.assert_called_once_with()
-    assert _domain_shutting_down(hass)
-
-    # Even if the timer callback were already in flight, it refuses to set up.
     entry.state = integration.ConfigEntryState.NOT_LOADED
-    _run(timers["resume"](None))
+    _run(timers["resume"](None))  # a timer already in flight still refuses
     hass.config_entries.async_setup.assert_not_awaited()
-    assert hass.data[DOMAIN][SHUTTING_DOWN] is True
+
+
+# ---------------------------------------------------------------------------
+# Addendum B: setup refuses while latched
+# ---------------------------------------------------------------------------
+
+
+def _setup_entry(mac=MAC):
+    return SimpleNamespace(
+        entry_id="entry_1",
+        title="Fluval Test",
+        data={"mac": mac},
+        options={},
+        unique_id=None,
+        async_on_unload=MagicMock(),
+    )
+
+
+def test_setup_refuses_before_anything_starts_when_the_process_is_latched():
+    hass = _hass()
+    hass.data[DOMAIN][SHUTTING_DOWN] = True
+    entry = _setup_entry()
+
+    with (
+        patch.object(integration, "Device", side_effect=AssertionError("no Device while shutting down")) as device,
+        patch.object(integration, "async_setup_link_watcher") as watcher,
+        patch.object(integration, "_register_static_paths", new=AsyncMock()) as static,
+    ):
+        with pytest.raises(integration.ConfigEntryNotReady):
+            _run(integration.async_setup_entry(hass, entry))
+
+    device.assert_not_called()
+    watcher.assert_not_called()
+    static.assert_not_awaited()
+
+
+def test_setup_refuses_when_the_latch_is_set_during_the_static_path_await():
+    hass = _hass()
+    entry = _setup_entry()
+
+    async def latch_while_awaiting(_hass):
+        hass.data[DOMAIN][SHUTTING_DOWN] = True
+
+    with (
+        patch.object(integration, "Device", side_effect=AssertionError("no Device while shutting down")) as device,
+        patch.object(integration, "async_setup_link_watcher") as watcher,
+        patch.object(integration, "_register_static_paths", new=latch_while_awaiting),
+        patch.object(integration, "_async_register_services"),
+    ):
+        with pytest.raises(integration.ConfigEntryNotReady):
+            _run(integration.async_setup_entry(hass, entry))
+
+    device.assert_not_called()
+    watcher.assert_not_called()
+
+
+def test_setup_overtaken_by_the_latch_during_platform_forwarding_releases_and_refuses():
+    hass = _FakeShutdownHass()
+    hass.state = integration.CoreState.running
+    hass.config_entries = SimpleNamespace(
+        async_forward_entry_setups=AsyncMock(),
+        async_unload_platforms=AsyncMock(return_value=True),
+        async_update_entry=MagicMock(),
+    )
+    entry = _setup_entry()
+    gatt_device = _make_device()
+    stopped = AsyncMock()
+    gatt_device.client = SimpleNamespace(stop=stopped)
+
+    async def forward(_entry, _platforms):
+        hass.data[DOMAIN][SHUTTING_DOWN] = True
+
+    hass.config_entries.async_forward_entry_setups = forward
+
+    def create_cached_device(*_args, **_kwargs):
+        return gatt_device
+
+    with (
+        patch.object(integration, "Device", create_cached_device),
+        patch.object(integration, "async_setup_link_watcher", return_value=MagicMock()),
+        patch.object(integration, "_register_static_paths", new=AsyncMock()),
+        patch.object(integration, "_register_websocket"),
+        patch.object(integration, "_register_services"),
+        patch.object(integration, "_async_register_services"),
+        patch.object(integration, "_migrate_legacy_registry_entries"),
+        patch.object(integration, "_cleanup_duplicate_devices"),
+        patch.object(integration, "_sync_product_identity"),
+        patch.object(integration, "async_setup_guardian", return_value=MagicMock()),
+        patch.object(
+            integration.bluetooth,
+            "async_last_service_info",
+            return_value=SimpleNamespace(device=_ble_device(), advertisement=_advertisement(), source="p"),
+            create=True,
+        ),
+    ):
+        with pytest.raises(integration.ConfigEntryNotReady):
+            _run(integration.async_setup_entry(hass, entry))
+
+    assert gatt_device.closing is True
+    stopped.assert_awaited_once()
+    hass.config_entries.async_unload_platforms.assert_awaited_once()
+    assert "entry_1" not in hass.data[DOMAIN]
+
+
+# ---------------------------------------------------------------------------
+# Addendum D: refusals are not faults
+# ---------------------------------------------------------------------------
+
+
+def test_end_override_refused_by_the_latch_records_no_failure_and_raises_no_repair():
+    device = _make_device()
+    guardian = ScheduleGuardian(device, expected_mode="auto")
+    guardian.override_active = True
+    guardian.status = "ok"
+    notified = MagicMock()
+    guardian.add_listener(notified)
+    device.closing = True  # latched before the user presses Return to schedule
+
+    result = _run(guardian.async_end_override())
+
+    assert result is None
+    assert guardian.status == "ok"
+    assert guardian.consecutive_failures == 0
+    assert guardian.override_active is True
+    notified.assert_not_called()
+
+
+def test_end_override_overtaken_by_the_latch_mid_restore_records_no_failure():
+    device = _make_device()
+    guardian = ScheduleGuardian(device, expected_mode="auto")
+    guardian.override_active = True
+    guardian.status = "ok"
+    notified = MagicMock()
+    guardian.add_listener(notified)
+
+    async def refused_after_latch(_mode):
+        device.closing = True
+        return None  # the command path refused to connect
+
+    device.async_ensure_mode = refused_after_latch
+
+    result = _run(guardian.async_end_override())
+
+    assert result is None
+    assert guardian.consecutive_failures == 0
+    assert guardian.status == "ok"
+    notified.assert_not_called()

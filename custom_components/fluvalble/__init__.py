@@ -21,8 +21,9 @@ from homeassistant.components import websocket_api
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import ATTR_DEVICE_ID, CONF_MAC, EVENT_HOMEASSISTANT_STARTED, Platform
 from homeassistant.core import CoreState, HassJob, HomeAssistant, ServiceCall, callback
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH, format_mac
@@ -56,6 +57,8 @@ except ImportError:  # pragma: no cover - stubbed test environments
     ConfigEntryState = None  # type: ignore[misc, assignment]
 
 _LOGGER = logging.getLogger(__name__)
+
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -226,6 +229,9 @@ WEBSOCKET_REGISTERED = "websocket_registered"
 # hass.data[DOMAIN] key, set (never cleared) once any entry's shutdown job has
 # latched the process closed. Outlives every entry unload.
 SHUTTING_DOWN = "shutting_down"
+# hass.data[DOMAIN] key: {id: cancel} of pending release_link resume timers, so
+# the domain-lifetime shutdown job can cancel them.
+RESUME_CANCELS = "release_link_resume_cancels"
 # Seconds the Stage-1 shutdown job may spend dropping one entry's link. Core
 # gives all shutdown jobs one shared 20 s budget; this keeps one stuck
 # disconnect from using all of it.
@@ -527,9 +533,15 @@ PLATFORMS: list[Platform] = [
 
 async def async_setup_entry(hass: HomeAssistant, entry: FluvalConfigEntry) -> bool:
     """Set up Fluval Aquarium LED from a config entry."""
+    # Shutdown latch (stage-1 job already ran, or is running): a fresh runtime
+    # would start with closing=False and its cached-advertisement path could
+    # open a link after the per-entry jobs were enumerated. Refuse - at entry
+    # and again after every await, before anything that could connect.
+    _raise_if_shutting_down(hass, entry)
     _async_register_services(hass)
     hass.data.setdefault(DOMAIN, {})
     await _register_static_paths(hass)
+    _raise_if_shutting_down(hass, entry)
     _register_websocket(hass)
     _register_services(hass)
     mac_raw = entry.data.get(CONF_MAC)
@@ -666,6 +678,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: FluvalConfigEntry) -> bo
     # immediately (device exists) or stash their add_entities callback
     # (device pending) so _create_device can populate them later.
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    if _domain_shutting_down(hass):
+        await _async_abort_setup_for_shutdown(hass, entry, runtime)
 
     @callback
     def update_ble(
@@ -673,7 +687,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: FluvalConfigEntry) -> bo
         change: bluetooth.BluetoothChange,
     ) -> None:
         log_discovery_update("Fluval BLE update: %s %s", service_info, change)
-        if runtime.closing:
+        if runtime.closing or _domain_shutting_down(hass):
             # Shutting down: keep the latch closed - no Device may be built
             # (its hold would connect) and no advertisement may re-arm one.
             return
@@ -1678,12 +1692,71 @@ async def async_unload_entry(hass: HomeAssistant, entry: FluvalConfigEntry) -> b
 
 
 def _domain_shutting_down(hass: HomeAssistant) -> bool:
-    """Return whether any entry has begun releasing its link for shutdown.
+    """Return whether the shutdown latch is set for this process.
 
-    Process-lifetime on purpose: it outlives every config-entry unload, so a
-    resume timer left behind by `release_link` can still see it.
+    Set by the domain-lifetime shutdown job (`_async_latch_at_shutdown`, never
+    removed) and by every per-entry job. Process-lifetime on purpose: it
+    outlives every config-entry unload, so a resume timer left behind by
+    `release_link` or a reload during Stage 1 can still see it.
     """
     return hass.data.get(DOMAIN, {}).get(SHUTTING_DOWN) is True
+
+
+def _raise_if_shutting_down(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Refuse to set an entry up once shutdown has latched the process."""
+    if _domain_shutting_down(hass):
+        raise ConfigEntryNotReady(f"Home Assistant is shutting down; not connecting to {entry.title}")
+
+
+async def _async_abort_setup_for_shutdown(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    runtime: FluvalRuntimeData,
+) -> None:
+    """Undo a setup that was overtaken by the shutdown latch, then refuse it.
+
+    The latch was set while this setup awaited platform forwarding, after a
+    Device may already have been built: release it exactly as the shutdown job
+    would (bounded, never raising), unload the platforms, and raise so Home
+    Assistant runs the entry's on-unload callbacks (watcher, shutdown job).
+    """
+    runtime.closing = True
+    await _async_release_link_at_shutdown(hass, entry, runtime)
+    with contextlib.suppress(Exception):
+        await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
+    raise ConfigEntryNotReady(f"Home Assistant is shutting down; not connecting to {entry.title}")
+
+
+@callback
+def _async_latch_at_shutdown(hass: HomeAssistant) -> None:
+    """Latch the whole process closed and cancel every pending release_link resume.
+
+    The domain-lifetime Stage-1 job. Core enumerates the shutdown-job list once
+    at the start of Stage 1, so a job registered later (or one removed by an
+    entry unload, as `release_link` does) is never run; this one is registered
+    once in async_setup and never removed. Runs in the same gather as the
+    per-entry release jobs, so a setup that starts afterwards refuses.
+    """
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    domain_data[SHUTTING_DOWN] = True
+    for cancel in list(domain_data.get(RESUME_CANCELS, {}).values()):
+        with contextlib.suppress(Exception):
+            cancel()
+    domain_data.get(RESUME_CANCELS, {}).clear()
+
+
+async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+    """Register the process-lifetime shutdown latch, once per Home Assistant run."""
+    hass.data.setdefault(DOMAIN, {})
+
+    @callback
+    def _latch() -> None:
+        _async_latch_at_shutdown(hass)
+
+    # Not removed on entry unload: core reads the job list once at Stage 1.
+    hass.async_add_shutdown_job(HassJob(_latch, "fluvalble shutdown latch"))
+    return True
 
 
 async def _async_release_link_at_shutdown(
@@ -1837,11 +1910,11 @@ async def _async_release_links(hass: HomeAssistant, resume_after: int) -> None:
     if not released or resume_after <= 0 or _domain_shutting_down(hass):
         return
 
-    remove_shutdown_job: Callable[[], None] | None = None
+    pending: dict[str, Callable[[], None]] = hass.data.setdefault(DOMAIN, {}).setdefault(RESUME_CANCELS, {})
+    resume_id = f"resume_{len(pending)}_{monotonic()}"
 
     async def _resume(_now: Any) -> None:
-        if remove_shutdown_job is not None:
-            remove_shutdown_job()
+        pending.pop(resume_id, None)
         if _domain_shutting_down(hass):
             return
         for entry in released:
@@ -1854,16 +1927,9 @@ async def _async_release_links(hass: HomeAssistant, resume_after: int) -> None:
             resume_after,
         )
 
-    cancel_resume = async_call_later(hass, resume_after, _resume)
-
-    @callback
-    def _cancel_resume_at_shutdown() -> None:
-        hass.data.setdefault(DOMAIN, {})[SHUTTING_DOWN] = True
-        cancel_resume()
-
-    remove_shutdown_job = hass.async_add_shutdown_job(
-        HassJob(_cancel_resume_at_shutdown, "fluvalble cancel release_link resume")
-    )
+    # Cancelled by the domain-lifetime shutdown job registered in async_setup
+    # (_async_latch_at_shutdown), which release_link's entry unloads cannot remove.
+    pending[resume_id] = async_call_later(hass, resume_after, _resume)
 
 
 @callback
