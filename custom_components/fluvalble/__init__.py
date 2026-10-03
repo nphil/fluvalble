@@ -576,8 +576,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: FluvalConfigEntry) -> bo
     last_discovery_log = 0.0
 
     def create_runtime_task(coroutine) -> asyncio.Task:
-        """Create a task owned by this config entry and track it for unload."""
-        task = hass.async_create_task(coroutine)
+        """Create a background task owned by this config entry and track it for unload."""
+        task = entry.async_create_background_task(hass, coroutine, f"fluvalble {mac} background")
         runtime.background_tasks.add(task)
         task.add_done_callback(runtime.background_tasks.discard)
         return task

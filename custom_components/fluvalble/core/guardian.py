@@ -25,7 +25,7 @@ and the device's connection listener.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 import contextlib
 from datetime import timedelta
 import logging
@@ -579,7 +579,11 @@ class ScheduleGuardian:
     # Home Assistant-facing runner
     # ------------------------------------------------------------------
 
-    def start_runner(self, hass: HomeAssistant) -> Callable[[], None]:
+    def start_runner(
+        self,
+        hass: HomeAssistant,
+        spawn: Callable[[Coroutine[Any, Any, None]], Any],
+    ) -> Callable[[], None]:
         """Wire this guardian to Home Assistant's clock and the connection state.
 
         Schedules a check on every connect and every ``check_interval_min``,
@@ -591,6 +595,11 @@ class ScheduleGuardian:
         A check that deferred to a user command is re-armed here through a
         single one-shot timer (`DEFERRED_RETRY_SECONDS`), replaced rather
         than stacked, and cancelled on unload.
+
+        `spawn` starts each check as a task owned by the config entry's
+        background tasks (`entry.async_create_background_task`), NOT
+        `hass.async_create_task`: a check connects to the fixture, and a
+        task Home Assistant tracks would make its startup wait for it.
         """
         unsubs: list[Callable[[], None]] = []
         retry: dict[str, Callable[[], None] | None] = {"unsub": None}
@@ -618,7 +627,7 @@ class ScheduleGuardian:
                 )
                 self._notify()
                 return
-            hass.async_create_task(_async_check_and_rearm())
+            spawn(_async_check_and_rearm())
 
         def _cancel_retry() -> None:
             unsub, retry["unsub"] = retry["unsub"], None
@@ -674,7 +683,10 @@ def async_setup_guardian(hass: HomeAssistant, entry: Any, device: Any) -> Schedu
         alert_after_failures=options.get(CONF_ALERT_AFTER_FAILURES, DEFAULT_ALERT_AFTER_FAILURES),
         expected_schedule=options.get(CONF_EXPECTED_SCHEDULE),
     )
-    unsub_runner = guardian.start_runner(hass)
+    unsub_runner = guardian.start_runner(
+        hass,
+        lambda coro: entry.async_create_background_task(hass, coro, f"fluvalble guardian check {device.mac}"),
+    )
     entry.async_on_unload(unsub_runner)
     # Deliberately no per-unload issue_registry cleanup here: async_on_unload
     # fires on every reload (including a routine options change), not just

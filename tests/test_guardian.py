@@ -491,8 +491,7 @@ async def _async_test_runner_rearms_a_deferred_check_instead_of_waiting_a_full_i
 
     created: list[object] = []
     hass = MagicMock()
-    hass.async_create_task.side_effect = created.append
-    unsub = guardian.start_runner(hass)
+    unsub = guardian.start_runner(hass, created.append)
 
     # start_runner's initial trigger: run the coroutine it handed to hass.
     assert len(created) == 1
@@ -783,13 +782,15 @@ def test_runner_registers_interval_callback_marked_for_loop_dispatch(monkeypatch
     hass = MagicMock()
     # hass is a mock, so close each coroutine it is handed instead of leaking
     # a never-awaited ScheduleGuardian.async_check().
-    hass.async_create_task.side_effect = lambda coro: coro.close()
-    unsub = guardian.start_runner(hass)
+    spawned = []
+    unsub = guardian.start_runner(hass, lambda coro: spawned.append(coro) or coro.close())
 
     assert getattr(captured["action"], "_hass_callback", False) is True
     assert captured["interval"].total_seconds() == 7 * 60
-    # The initial check and any tick both create the task on the loop side.
-    hass.async_create_task.assert_called()
+    # The initial check and any tick both create the task on the loop side,
+    # through the entry-owned spawner and never hass.async_create_task.
+    assert len(spawned) == 1
+    hass.async_create_task.assert_not_called()
     unsub()
 
 
@@ -895,8 +896,7 @@ async def _async_test_interval_check_is_skipped_while_one_is_already_running(cap
 
     hass = MagicMock()
     created_tasks = []
-    hass.async_create_task.side_effect = lambda coro: created_tasks.append(coro) or coro.close()
-    guardian.start_runner(hass)
+    guardian.start_runner(hass, lambda coro: created_tasks.append(coro) or coro.close())
 
     assert len(created_tasks) == 1  # only start_runner's own initial trigger
 

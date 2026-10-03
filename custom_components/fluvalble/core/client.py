@@ -20,7 +20,7 @@ _LOGGER = logging.getLogger(__name__)
 
 ACTIVE_TIME = 120
 COMMAND_TIME = 15
-CONNECT_TIMEOUT = 20
+CONNECT_TIMEOUT = 10
 CONNECT_RETRIES = 3
 WRITE_RETRIES = 2
 WRITE_DELAY = 0.3
@@ -40,8 +40,8 @@ CHUNK_WRITE_GAP = 0.01
 # start_notify/stop_notify, and disconnect in this module goes through
 # `_bounded()` with one of these deadlines so a stuck peripheral fails the
 # one call in flight instead of hanging every caller behind it.
-CONNECT_DEADLINE = 30.0
-GATT_OP_DEADLINE = 15.0
+CONNECT_DEADLINE = 10.0
+GATT_OP_DEADLINE = 10.0
 DISCONNECT_DEADLINE = 5.0
 
 # Reconnect pacing for a held link. `_ping_loop` owns every reconnect cycle,

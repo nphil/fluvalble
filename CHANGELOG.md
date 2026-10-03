@@ -5,6 +5,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.5.2]
+
+### Fixed
+- **Startup never waits on the lamp.** The guardian's connect-triggered and interval checks, and the legacy auto-schedule migration, now run as tasks owned by the config entry (`entry.async_create_background_task`) instead of `hass.async_create_task`. Home Assistant tracks the latter and waits for them before reporting startup finished, and a guardian check connects to the fixture (bounded only by `CHECK_OVERALL_TIMEOUT`, 120 s), so an absent lamp or a busy Bluetooth proxy could hold startup open. `ScheduleGuardian.start_runner` now takes the spawner as a required argument.
+- **A stuck connect or GATT step now fails within 10 s** (was 30 s for the connect and 15 s for subscribe/read/write): `CONNECT_DEADLINE`, `CONNECT_TIMEOUT` and `GATT_OP_DEADLINE` are 10 s. A failed attempt reconnects through habluetooth's normal routing and the preferred-proxy affinity as before.
+
+### Added
+- `tests/test_startup_budget.py`: setup returns at once with a connect that hangs forever, or a lamp never seen; entities appear when the first advertisement arrives after setup; late entities and first data send no command; connect/GATT deadlines stay within 10 s.
+
+---
+
 ## [1.5.1]
 
 ### Fixed
