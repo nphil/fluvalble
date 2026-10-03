@@ -5,6 +5,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.5.3]
+
+### Fixed
+- **A stalled proxy subscribe is stopped by the backend, not by cancelling it (startup contract S8).** The 10 s outer guard around `start_notify` cancelled the awaiting task; on an ESPHome proxy (aioesphomeapi 46.2.0) that leaves an abandoned notification handler registered, because the handler is added before the proxy's acknowledgement is awaited and removed only on an exception, never on cancellation. Every `start_notify` now passes `timeout=4.0` (bleak-esphome bounds each proxy round trip; two of them fit inside 8 s), every `read_gatt_char` passes `timeout=8.0`, and `establish_connection` uses `CONNECT_TIMEOUT = 8` per attempt, so the backend's own error path runs first. The 10 s outer guards stay as a safety net. `write_gatt_char` has no timeout parameter in bleak, so writes keep only the outer guard.
+- **A detached link is always released, even if the task doing it is cancelled.** `Device.async_reset_connection()` detaches the Client before awaiting `Client.stop()`; since 1.5.2 the guardian check that triggers it is an entry-owned background task, which Home Assistant cancels on reload or `release_link`. The `CancelledError` escaped the unsubscribe loop in `Client._async_disconnect()` and skipped the disconnect, leaving the link open (blocking the replacement entry and the phone app). Client teardown now runs in its own task awaited through `asyncio.shield` (`_run_to_completion`), every disconnect of a detached `BleakClient` (`_disconnect_detached`, `_safe_disconnect`, the connect path) does the same, and a cancellation during connect/subscribe now disconnects the half-open link instead of stranding it.
+
+### Added
+- `tests/test_gatt_teardown.py`: backend timeout is passed and shorter than the outer guard; a never-acknowledged subscribe ends through the backend's own timeout and unregisters its handler; cancelling the task that resets the connection, the guardian check that timed out, or a connect after the link opened still disconnects the link.
+
+---
+
 ## [1.5.2]
 
 ### Fixed

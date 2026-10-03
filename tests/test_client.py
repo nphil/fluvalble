@@ -31,7 +31,7 @@ class _FakeGattClient:
         self.state = state
         self.writes = []
 
-    async def read_gatt_char(self, _uuid):
+    async def read_gatt_char(self, _uuid, **_kwargs):
         return self.state
 
     async def write_gatt_char(self, uuid, data, response):
@@ -839,7 +839,7 @@ class _HangingGattClient:
         self.is_connected = True
         self.disconnect_calls = 0
 
-    async def read_gatt_char(self, _uuid):
+    async def read_gatt_char(self, _uuid, **_kwargs):
         await asyncio.sleep(3600)
 
     async def write_gatt_char(self, _uuid, data, response):

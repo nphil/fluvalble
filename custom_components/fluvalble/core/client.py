@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 import logging
 import random
 import time
+from typing import Any
 
 from bleak import BleakClient, BleakError, BleakGATTCharacteristic, BLEDevice
 from bleak_retry_connector import establish_connection
@@ -20,7 +21,7 @@ _LOGGER = logging.getLogger(__name__)
 
 ACTIVE_TIME = 120
 COMMAND_TIME = 15
-CONNECT_TIMEOUT = 10
+CONNECT_TIMEOUT = 8
 CONNECT_RETRIES = 3
 WRITE_RETRIES = 2
 WRITE_DELAY = 0.3
@@ -43,6 +44,48 @@ CHUNK_WRITE_GAP = 0.01
 CONNECT_DEADLINE = 10.0
 GATT_OP_DEADLINE = 10.0
 DISCONNECT_DEADLINE = 5.0
+# Backend-side timeouts, always shorter than the outer guards above (startup
+# contract S8). The outer guard cancels the awaiting task; for an ESPHome
+# proxy that is the WRONG way to stop a stalled subscribe: aioesphomeapi
+# registers the notification handler before it awaits the proxy's
+# acknowledgement and removes it only on an exception, never on
+# cancellation, so a cancelled subscribe leaves an abandoned handler behind.
+# bleak-esphome's `timeout=` bounds EACH proxy round trip (the subscribe, then
+# the CCCD write on caching connections): 2 x 4 s <= 8 s < GATT_OP_DEADLINE,
+# so the backend's own error path runs first and unregisters the handler.
+# Other backends ignore the keyword. `write_gatt_char` has no timeout
+# parameter, so writes keep only the outer guard.
+START_NOTIFY_TIMEOUT = 4.0
+GATT_READ_TIMEOUT = 8.0
+
+# Strong references to detached teardown tasks: the event loop keeps only weak
+# references, and a task that must outlive its cancelled caller would
+# otherwise be collectable mid-disconnect.
+_TEARDOWN_TASKS: set[asyncio.Task] = set()
+
+
+def _log_teardown_failure(task: asyncio.Task) -> None:
+    """Retrieve a finished teardown task's outcome so it is never 'never retrieved'."""
+    _TEARDOWN_TASKS.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        _LOGGER.debug("Fluval BLE teardown task failed", exc_info=task.exception())
+
+
+async def _run_to_completion(awaitable) -> Any:
+    """Await `awaitable` in its own task so cancelling the caller cannot abandon it.
+
+    Used for every disconnect/teardown step: Home Assistant cancels
+    entry-owned background tasks (the guardian check that triggered a
+    timeout-reset, for one) on unload, and a CancelledError delivered while a
+    link is being released must not skip the disconnect and leave the
+    detached link open, which would block the replacement entry and the
+    phone app. The caller still sees its own cancellation as soon as it
+    arrives; the teardown carries on in the background and finishes.
+    """
+    task = asyncio.get_running_loop().create_task(awaitable)
+    _TEARDOWN_TASKS.add(task)
+    task.add_done_callback(_log_teardown_failure)
+    return await asyncio.shield(task)
 
 # Reconnect pacing for a held link. `_ping_loop` owns every reconnect cycle,
 # so one failed cycle sleeps `reconnect_delay(n)` before the next attempt:
@@ -305,9 +348,7 @@ class Client:
             )
             self._broken = True
             if disconnect is not None:
-                with contextlib.suppress(Exception):
-                    async with asyncio.timeout(DISCONNECT_DEADLINE):
-                        await disconnect.disconnect()
+                await self._disconnect_detached(disconnect)
             raise BleakOperationTimeoutError(
                 f"Fluval BLE {description} timed out after {timeout:g}s"
             ) from err
@@ -463,8 +504,7 @@ class Client:
             self._session_initialized = False
             self._broken = False
             if stale_client is not None:
-                with contextlib.suppress(Exception):
-                    await asyncio.wait_for(stale_client.disconnect(), timeout=DISCONNECT_DEADLINE)
+                await self._disconnect_detached(stale_client)
 
             device = self._current_device()
             self.connection_attempts += 1
@@ -487,8 +527,7 @@ class Client:
                 raise
 
             if self._stopping:
-                with contextlib.suppress(Exception):
-                    await asyncio.wait_for(client.disconnect(), timeout=DISCONNECT_DEADLINE)
+                await self._disconnect_detached(client)
                 raise BleakError("Fluval BLE client stopped while connecting")
 
             self.client = client
@@ -502,14 +541,15 @@ class Client:
                         # down a connection the remaining candidates could
                         # still subscribe on.
                         await self._bounded(
-                            client.start_notify(uuid, self.notify_callback),
+                            client.start_notify(uuid, self.notify_callback, timeout=START_NOTIFY_TIMEOUT),
                             GATT_OP_DEADLINE,
                             f"start_notify {uuid}",
                         )
-            except Exception:
+            except BaseException:
+                # BaseException: a cancellation here (unload cancelling the
+                # task that owns this connect) must not strand an open link.
                 self.client = None
-                with contextlib.suppress(Exception):
-                    await asyncio.wait_for(client.disconnect(), timeout=DISCONNECT_DEADLINE)
+                await self._disconnect_detached(client)
                 raise
 
             if self.connection_ready_callback:
@@ -666,7 +706,7 @@ class Client:
             if self.wake_read_uuid:
                 with contextlib.suppress(BleakError):
                     await self._bounded(
-                        client.read_gatt_char(self.wake_read_uuid),
+                        client.read_gatt_char(self.wake_read_uuid, timeout=GATT_READ_TIMEOUT),
                         GATT_OP_DEADLINE,
                         "wake read",
                     )
@@ -729,7 +769,7 @@ class Client:
                     if self.wake_read_uuid:
                         with contextlib.suppress(BleakError):
                             await self._bounded(
-                                client.read_gatt_char(self.wake_read_uuid),
+                                client.read_gatt_char(self.wake_read_uuid, timeout=GATT_READ_TIMEOUT),
                                 GATT_OP_DEADLINE,
                                 "heartbeat wake read",
                             )
@@ -851,7 +891,7 @@ class Client:
         if self.wake_read_uuid:
             with contextlib.suppress(BleakError):
                 await self._bounded(
-                    client.read_gatt_char(self.wake_read_uuid),
+                    client.read_gatt_char(self.wake_read_uuid, timeout=GATT_READ_TIMEOUT),
                     GATT_OP_DEADLINE,
                     "wake read",
                 )
@@ -869,7 +909,7 @@ class Client:
             for read_uuid in self.state_read_uuids or [self.notify_uuid]:
                 try:
                     data = await self._bounded(
-                        client.read_gatt_char(read_uuid),
+                        client.read_gatt_char(read_uuid, timeout=GATT_READ_TIMEOUT),
                         GATT_OP_DEADLINE,
                         f"state read {read_uuid}",
                     )
@@ -942,7 +982,7 @@ class Client:
                 if self.wake_read_uuid:
                     with contextlib.suppress(BleakError):
                         await self._bounded(
-                            client.read_gatt_char(self.wake_read_uuid),
+                            client.read_gatt_char(self.wake_read_uuid, timeout=GATT_READ_TIMEOUT),
                             GATT_OP_DEADLINE,
                             "wake read",
                         )
@@ -1015,16 +1055,22 @@ class Client:
             await self._safe_disconnect()
             return False
 
+    async def _disconnect_detached(self, client: BleakClient) -> None:
+        """Disconnect one BleakClient, bounded, and finish even if the caller is cancelled."""
+        with contextlib.suppress(Exception):
+            await _run_to_completion(asyncio.wait_for(client.disconnect(), timeout=DISCONNECT_DEADLINE))
+
     async def _safe_disconnect(self):
         """Disconnect the underlying BLE client without masking the original error."""
         client = self.client
         self.client = None
         self._session_initialized = False
-        if client:
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(client.disconnect(), timeout=DISCONNECT_DEADLINE)
-        if self.status_callback:
-            self.status_callback(False)
+        try:
+            if client:
+                await self._disconnect_detached(client)
+        finally:
+            if self.status_callback:
+                self.status_callback(False)
 
     async def disconnect(self):
         """Disconnect from the Fluval while keeping this client reusable."""
@@ -1038,6 +1084,12 @@ class Client:
         what matters there, the peripheral discards its subscriptions with
         it, and every unsubscribe is a GATT round trip spent out of a
         bounded budget.
+
+        The teardown runs to completion even when the caller is cancelled
+        (see `_run_to_completion`): `Device.async_reset_connection()` detaches
+        this Client before awaiting it, so if Home Assistant cancels the task
+        that is doing the awaiting (an entry-owned guardian check, on reload
+        or release_link) nothing else would ever disconnect the link.
         """
         self._stopping = True
         self.ping_time = 0
@@ -1045,6 +1097,10 @@ class Client:
         if self.ping_future:
             self.ping_future.cancel()
 
+        await _run_to_completion(self._async_teardown(final=final, stop_notify=stop_notify))
+
+    async def _async_teardown(self, *, final: bool, stop_notify: bool) -> None:
+        """Stop the background tasks and drop the link; see `_async_disconnect`."""
         if self.ping_task:
             self.ping_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, TimeoutError):
