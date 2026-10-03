@@ -2788,6 +2788,24 @@ class Device:
         if self._clock_synced and not force:
             return True
 
+        # Connect BEFORE taking `_clock_sync_lock`. A connecting Client
+        # finishes its first session under its own initialization lock and,
+        # from inside it, `_async_on_client_ready` takes `_clock_sync_lock`.
+        # Holding that lock here while waiting for the same initialization
+        # (`ensure_connected`) is a lock-order inversion: both sides wait on
+        # each other until the caller's deadline cancels this one - observed
+        # live as a guardian clock sync that always ran its full 30 s at
+        # startup, with every command queued behind it.
+        if self.client is None:
+            if not await self._async_ensure_client():
+                return False
+        elif not await self.client.ensure_connected():
+            self._set_diagnostic_error(
+                "clock_sync_failed",
+                self.client.last_error or "Unable to connect for clock sync",
+            )
+            return False
+
         async with self._clock_sync_lock:
             if self._clock_synced and not force:
                 return True
@@ -2795,12 +2813,6 @@ class Device:
             if self.client is None:
                 if not await self._async_ensure_client():
                     return False
-            elif not await self.client.ensure_connected():
-                self._set_diagnostic_error(
-                    "clock_sync_failed",
-                    self.client.last_error or "Unable to connect for clock sync",
-                )
-                return False
 
             self._clock_sync_started = await self._async_send_clock_command()
             if not self._clock_sync_started:

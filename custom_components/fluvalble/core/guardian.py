@@ -93,8 +93,8 @@ UNREACHABLE_ALERT_THRESHOLD = 3
 # individual GATT op beneath that; these are tighter so a wedged step is
 # reported as this guardian's own "unreachable"/"failed" outcome - with a
 # connection reset - well before the Device-level backstop would even fire.
-CHECK_CLOCK_SYNC_TIMEOUT = 30.0
-CHECK_READ_STATE_TIMEOUT = 30.0
+CHECK_CLOCK_SYNC_TIMEOUT = 10.0
+CHECK_READ_STATE_TIMEOUT = 10.0
 CHECK_ENSURE_MODE_TIMEOUT = 30.0
 CHECK_SCHEDULE_REPUSH_TIMEOUT = 60.0
 # Hard cap on one whole check cycle, regardless of how many of the above
@@ -105,6 +105,11 @@ CHECK_OVERALL_TIMEOUT = 120.0
 # (0.4-2s on a held link) plus a follow-up press to finish, short enough
 # that supervision is not actually skipped.
 DEFERRED_RETRY_SECONDS = 20
+# A held link that is still connecting when the guardian starts is left to
+# its own supervisor: the connect itself fires a check the moment the link is
+# up (`register_connection_listener`). This is the longest the first check
+# waits for that, so an absent fixture still gets its (unreachable) verdict.
+INITIAL_CHECK_GRACE_SECONDS = 15
 
 # Suffix of the schedule-problem repair's issue_id. Shared with repairs.py,
 # which has to tell this integration's two repairs apart from the id alone.
@@ -603,6 +608,7 @@ class ScheduleGuardian:
         """
         unsubs: list[Callable[[], None]] = []
         retry: dict[str, Callable[[], None] | None] = {"unsub": None}
+        rerun = {"pending": False}
 
         # ``@callback`` matters: async_track_time_interval runs a plain function
         # in an executor thread, and hass.async_create_task from a thread is
@@ -610,7 +616,7 @@ class ScheduleGuardian:
         # than the event loop" every interval). Marked as a loop callback it
         # runs inline on the event loop, where creating the task is legal.
         @callback
-        def _run_check_soon(*_args: Any) -> None:
+        def _run_check_soon(*_args: Any, after_connect: bool = False) -> None:
             if self._device_closing():
                 return
             if self._check_lock.locked():
@@ -625,6 +631,12 @@ class ScheduleGuardian:
                     "Fluval guardian check for %s already running; skipping this trigger",
                     getattr(self.device, "mac", "?"),
                 )
+                if after_connect:
+                    # The link came up while a check that began before it was
+                    # still running: that check may have judged the fixture
+                    # unreachable, so run one more as soon as it finishes
+                    # instead of waiting a whole interval.
+                    rerun["pending"] = True
                 self._notify()
                 return
             spawn(_async_check_and_rearm())
@@ -640,7 +652,11 @@ class ScheduleGuardian:
             _run_check_soon()
 
         async def _async_check_and_rearm() -> None:
-            if await self.async_check() != STATUS_DEFERRED:
+            status = await self.async_check()
+            if rerun["pending"]:
+                rerun["pending"] = False
+                status = await self.async_check()
+            if status != STATUS_DEFERRED:
                 _cancel_retry()
                 return
             _cancel_retry()
@@ -656,13 +672,27 @@ class ScheduleGuardian:
 
         def _on_connection_changed(connected: bool) -> None:
             if connected:
-                _run_check_soon()
+                _run_check_soon(after_connect=True)
 
         unsubs.append(self.device.register_connection_listener(_on_connection_changed))
 
         # The device may already be connected (or connect before the first
-        # interval elapses) - run an initial check rather than waiting.
-        _run_check_soon()
+        # interval elapses) - run an initial check rather than waiting. A held
+        # link that is still connecting is the exception (strict `is`, so a
+        # device double without these attributes keeps the old behaviour): a
+        # check started now would only sit behind the connect holding the
+        # device's command lock, so every user command and automation that
+        # starts with Home Assistant queued behind it. The connect fires its
+        # own check; a timer covers a link that never comes up.
+        link_connecting = (
+            getattr(self.device, "hold_active", False) is True
+            and getattr(self.device, "connected", True) is False
+            and getattr(self.device, "client", None) is not None
+        )
+        if link_connecting:
+            retry["unsub"] = async_call_later(hass, INITIAL_CHECK_GRACE_SECONDS, _retry_now)
+        else:
+            _run_check_soon()
 
         def _unsub() -> None:
             _cancel_retry()

@@ -5,6 +5,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.5.4]
+
+### Fixed
+- **Home Assistant startup no longer waits ~30 s on the lamp.** Root cause, reproduced with a real Home Assistant 2026.9 instance and a fake lamp: the guardian's first clock sync always ran its full 30 s deadline. `Device.async_sync_clock` held `_clock_sync_lock` while waiting for `Client.ensure_connected()`, which waits for the Client's session-initialization lock; the connect task holds that lock and, from inside it, `_async_on_client_ready` takes `_clock_sync_lock`. Each waited for the other until the deadline cancelled the sync. The sync held the device's command lock the whole time, so any service call or automation that starts with Home Assistant (a tracked task) queued behind it and `async_block_till_done()` waited with it (a `light.turn_on` at startup took 39.7 s). `async_sync_clock` now connects before taking `_clock_sync_lock`; the same call completes in ~0.1 s.
+- **The first guardian check no longer sits on the command lock while a held link is still connecting.** In hold mode the check is left to the connection event (`register_connection_listener` already fires a check the moment the link is up); `INITIAL_CHECK_GRACE_SECONDS` (15 s) starts it anyway if the link never comes up, so an absent lamp still gets its unreachable verdict. Non-hold installs are unchanged.
+- **A connect-triggered check skipped because one was already running is retried.** The running check may have started before the link was up and judged it unreachable; one more check now runs as soon as it finishes instead of waiting a whole interval.
+- **Guardian clock-sync and state-read steps are capped at 10 s** (was 30 s; startup contract S4).
+
+### Task audit (nothing radio-bound is tracked by Home Assistant)
+No `hass.async_create_task` / `async_add_job` remains in the package. Guardian checks and the legacy schedule migration are entry background tasks; the Client connect/ping tasks and the software-preview task are plain asyncio tasks (never tracked); every timer callback (`async_track_time_interval`, `async_call_later`, `async_track_point_in_time`, EVENT_HOMEASSISTANT_STARTED listener) is a synchronous `@callback` that only spawns a background task or updates state. Service handlers and entity commands are tracked by Home Assistant by nature; they are now bounded by the connect rather than by the 30 s guardian deadlock.
+
+### Added
+- `tests/test_startup_tracking.py` (8 tests): clock sync while the held link connects no longer deadlocks (also the forced Sync-clock button); first check does not take the command lock while connecting and runs on the connection event; grace-period fallback; skipped connect trigger is retried; 10 s step caps; with a clock sync that hangs forever `async_block_till_done()` returns at once (tracked-task registry double: tracked tasks block, background ones do not); a user command at startup is not queued behind the guardian.
+
+---
+
 ## [1.5.3]
 
 ### Fixed

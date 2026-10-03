@@ -128,12 +128,13 @@ def test_setup_returns_at_once_when_every_connect_step_hangs_forever():
             runtime = integration.entry_runtime_data(hass, entry)
             assert runtime.device is not None and runtime.device.client is not None
             assert runtime.device.connected is False
-            # Home Assistant's own tracked task list must not hold a check
-            # that connects: it would delay "initialized".
+            # Home Assistant's own tracked task list must not hold anything
+            # that connects: it would delay "initialized". The first guardian
+            # check is not started at all while the held link is connecting;
+            # it runs (as an entry background task) when the link comes up,
+            # or after a grace period (see test_startup_tracking).
             hass.async_create_task.assert_not_called()
-            assert any("guardian check" in name for name in entry.task_names), (
-                "guardian's first check must be an entry background task"
-            )
+            assert not any("guardian check" in name for name in entry.task_names)
 
             await _cancel(entry.background_tasks)
             await runtime.device.client.stop()
