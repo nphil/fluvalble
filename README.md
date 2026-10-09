@@ -146,6 +146,16 @@ The **Active connection window** accepts `0` for a persistent connection or
   proxy scoring (RSSI, in-flight connects, free slots), so a link that drops
   comes back on the best proxy available - not necessarily the previous one -
   with a 1, 2, 5, 10, 30, 60 s backoff between failed attempts.
+- **A ghost link is freed automatically.** If a proxy glitch leaves a proxy
+  holding the light's connection after the proxy itself has forgotten it, the
+  light stops advertising and cannot be reached. After 3 minutes without the
+  light being heard by any proxy since its link ended, the integration asks the
+  proxy that last held it to drop its connections one at a time
+  (`esphome.<proxy>_force_disconnect_handle`, connection 0 to 3) until the light
+  is heard again, then retries after 30 minutes, 2 hours and every 6 hours while
+  it stays silent. A proxy without that action is left alone, and a light that
+  is heard but cannot be connected is never touched. `ghost_links_freed` and
+  `last_ghost_try` on the Connection sensor show what happened.
 
 A finite window (`30`–`600` seconds) restores the previous behaviour: it
 releases the connection when idle so the official Fluval app or a Fluval
@@ -284,7 +294,7 @@ After setup you'll see one device with entities like:
 | **Binary sensor** | Reachable | Fixture seen recently over BLE; raw GATT connection state remains available as an attribute. |
 | **Binary sensor** | Schedule problem | On after repeated failed guardian corrections or extended unreachability; pairs with a repair notification. |
 | **Sensors** | Signal strength / Source / Last seen | Optional Bluetooth diagnostics. Signal strength is disabled by default; Source shows the active route's friendly name. Last seen counts GATT traffic, not just advertisements, so it stays current on a held link. |
-| **Sensor** | Connection | The proxy or adapter name currently carrying the GATT link, or `disconnected`. Attributes: `hold`, `drops_1h`, `last_drop`, `reconnect_attempt`. |
+| **Sensor** | Connection | The proxy or adapter name currently carrying the GATT link, or `disconnected`. Attributes: `hold`, `drops_1h`, `last_drop`, `reconnect_attempt`, `ghost_links_freed`, `last_ghost_try`. |
 | **Sensors** | Guardian status / last check / corrections | Guardian outcome (`unknown` until the first check completes, then `ok`/`corrected`/`failed`/`unreachable`/`paused`/`deferred`), when it last ran, and a running correction count. |
 | **Button** | Sync Clock | Synchronizes the fixture's real-time clock with Home Assistant. |
 | **Button** | Return to schedule | Ends an active manual override immediately instead of waiting for the return timer. |

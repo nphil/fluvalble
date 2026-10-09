@@ -552,6 +552,8 @@ def test_hold_attributes_track_drops_and_reconnect_progress():
         "reconnect_attempt": 0,
         "preferred_proxy": "",
         "via_preferred_proxy": False,
+        "ghost_links_freed": 0,
+        "last_ghost_try": None,
     }
 
     device.hold_stats.record_drop()

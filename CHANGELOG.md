@@ -5,6 +5,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.5.5]
+
+### Added
+- **Silent ghost-link release.** A proxy glitch can leave the proxy's radio controller holding the lamp's connection after the proxy's host has forgotten it: the lamp believes it is still connected, never advertises, and (it only answers requests) the house's orphan-frame detector never sees it. `core/ghost.py` (`GhostLinkWatch`, owned by the `Device` like `ConnectionHoldStats` so it survives a Client replacement) measures silence as no advertisement from any scanner (`bluetooth.async_last_service_info(...).time`, the `time.monotonic()` clock) since the last held session ended, or since the Device was created. `Client._ping_loop` asks it at the top of every connect cycle, with no lock held. After `GHOST_SILENCE` (180 s), while the client is not stopping, no link is up and the Device's shutdown latch (`closing`) is clear, it calls `esphome.<slugified last_holding_proxy>_force_disconnect_handle` for handles 0..3 one at a time (each bounded to 5 s, 5 s listen between), stopping as soon as the lamp is heard. A proxy without that action, or no recorded proxy, is left alone (recorded only). Still silent after a full pass: retry after 30 min, 2 h, then every 6 h, counted from the end of each pass; the step resets when a session ends. One INFO line on success, one WARNING per unsuccessful pass. A failed call never raises out of the supervisor.
+- `ghost_links_freed` and `last_ghost_try` on the Connection sensor's attributes and a `ghost_link` section in the diagnostics dump. No new entities, options, helpers or automations.
+- `Device(last_holder_getter=...)` (reads `last_holding_proxy` from the entry options live) and `Client(ghost_watch=...)`.
+- `tests/test_ghost_link.py` (13 tests): freed on handle N then the supervisor reconnects; nothing before the silence window; heard-but-unconnectable is never swept; proxy without the action / no recorded proxy is left alone; still-silent waits the retry pause from the end of the pass; silence clock restarts when a session ends; shutdown latch, stopping client and a live link end the pass; failed and hung proxy calls are bounded and never raise; Device wiring and diagnostics.
+
+---
+
 ## [1.5.4]
 
 ### Fixed

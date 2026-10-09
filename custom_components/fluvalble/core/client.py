@@ -16,6 +16,7 @@ from bleak import BleakClient, BleakError, BleakGATTCharacteristic, BLEDevice
 from bleak_retry_connector import establish_connection
 
 from . import encryption, protocol
+from .ghost import GhostLinkWatch
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -240,6 +241,7 @@ class Client:
         activity_callback: Callable[[], None] | None = None,
         hold_stats: ConnectionHoldStats | None = None,
         client_class: type[BleakClient] | None = None,
+        ghost_watch: GhostLinkWatch | None = None,
     ) -> None:
         """Initialize the client."""
         self.device = device
@@ -256,6 +258,9 @@ class Client:
         # honest while the fixture is answering us over GATT.
         self.activity_callback = activity_callback
         self.hold_stats = hold_stats if hold_stats is not None else ConnectionHoldStats()
+        # Silent-ghost release, owned by the Device so it survives this Client
+        # being replaced; None for a bare Client (no hass, no proxy to ask).
+        self.ghost_watch = ghost_watch
         # Device may hand us a BleakClient subclass that prefers one proxy
         # (see core/device.py `_affinity_client_class`); default to the
         # plain habluetooth-wrapped class when it does not.
@@ -753,6 +758,10 @@ class Client:
         failures = 0
         while time.time() < self.ping_time and not self._stopping:
             failed = False
+            in_session = False
+            # A light that stayed silent after losing its link may be held by a
+            # ghost on the proxy; free it while the link is down. Never raises.
+            await self._free_silent_ghost()
             try:
                 # Reconnect only after any command using the old link has
                 # finished its failure handling. This also makes the heartbeat
@@ -763,6 +772,9 @@ class Client:
                     raise BleakError("Fluval BLE session initialization failed")
                 failures = 0
                 self.hold_stats.record_connected()
+                in_session = True
+                if self.ghost_watch is not None:
+                    self.ghost_watch.session_started()
 
                 # heartbeat loop
                 while time.time() < self.ping_time and not self._stopping and client is self.client:
@@ -808,6 +820,11 @@ class Client:
             except Exception as e:
                 failed = True
                 _LOGGER.warning("ping error", exc_info=e)
+            finally:
+                if in_session:
+                    # Whatever ended it (drop, failure, idle disconnect, stop),
+                    # the light should advertise again from here.
+                    self._ghost_session_ended()
             if failed:
                 failures += 1
                 self.hold_stats.record_reconnect_attempt(failures)
@@ -831,6 +848,32 @@ class Client:
                 await asyncio.sleep(1)
 
         self.ping_task = None
+
+    def _ghost_session_ended(self) -> None:
+        """Tell the ghost watch that a session we were holding is over."""
+        if self.ghost_watch is not None:
+            self.ghost_watch.session_ended()
+
+    def _ghost_pass_must_stop(self) -> bool:
+        """True while this client is stopping or a link is up (never sweep a link we hold)."""
+        if self._stopping:
+            return True
+        client = self.client
+        return client is not None and bool(getattr(client, "is_connected", False))
+
+    async def _free_silent_ghost(self) -> None:
+        """Let the ghost watch free a silent light from the proxy that last held it.
+
+        Runs at the top of every supervisor cycle with no lock held, so a
+        command never queues behind it. A failure here must never stop the
+        supervisor; only cancellation (stop) passes through.
+        """
+        if self.ghost_watch is None:
+            return
+        try:
+            await self.ghost_watch.free_silent_ghost(self._ghost_pass_must_stop)
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.warning("Fluval BLE ghost-link release for %s failed", self.device.address, exc_info=err)
 
     async def _write_packet(self, uuid: str, data: bytes):
         """Write a packet using the right wire format for the active profile."""

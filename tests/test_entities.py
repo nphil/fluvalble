@@ -972,6 +972,8 @@ def test_connection_sensor_reports_the_proxy_name_and_hold_attributes():
         "reconnect_attempt": 0,
         "preferred_proxy": "",
         "via_preferred_proxy": False,
+        "ghost_links_freed": 0,
+        "last_ghost_try": None,
     }
 
 

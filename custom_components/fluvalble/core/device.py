@@ -29,6 +29,7 @@ from . import (
 )
 from ..ble_affinity import make_affinity_client_class
 from .client import Client, ConnectionHoldStats
+from .ghost import GhostLinkWatch
 from .color import channel_percentages_to_rgb, rgb_to_channel_percentages
 from .discovery import (
     CONF_MODEL,
@@ -424,6 +425,7 @@ class Device:
         ping_interval: int = 10,
         active_time: int = 120,
         preferred_getter: Callable[[], str | None] | None = None,
+        last_holder_getter: Callable[[], str | None] | None = None,
     ) -> None:
         """Initialize the device."""
         config_data = config_data or {}
@@ -520,6 +522,14 @@ class Device:
         self._priority_idle.set()
         # Survives the Client being replaced (async_reset_connection).
         self.hold_stats = ConnectionHoldStats()
+        # Also survives it: the silence clock and counters of the silent-ghost
+        # release (see core/ghost.py). Needs hass to look up the proxy action.
+        self.ghost_watch = GhostLinkWatch(
+            hass,
+            self.address,
+            last_holder_getter or (lambda: None),
+            lambda: self.closing,
+        )
         # Preserve the exact colour HA requested while the decoded physical
         # channels still match it.  Plant RGB conversion is intentionally
         # lossy, so reconstructing RGB from those five channels would otherwise
@@ -829,6 +839,8 @@ class Device:
             "reconnect_attempt": self.hold_stats.reconnect_attempt,
             "preferred_proxy": self._preferred_getter() or "",
             "via_preferred_proxy": self._via_preferred_proxy,
+            "ghost_links_freed": self.ghost_watch.links_freed,
+            "last_ghost_try": self.ghost_watch.last_try,
         }
 
     def cancel_reachability_refresh(self) -> None:
@@ -3118,6 +3130,7 @@ class Device:
                 "ping_interval": self._ping_interval,
                 "active_time": self._active_time,
             },
+            "ghost_link": self.ghost_watch.snapshot(),
             "values": dict(self.values),
             "connection_info": dict(self.conn_info),
             "last_diagnostics": dict(self.diagnostics),
@@ -3208,6 +3221,7 @@ class Device:
             activity_callback=self._on_client_activity,
             hold_stats=self.hold_stats,
             client_class=self._affinity_client_class(),
+            ghost_watch=self.ghost_watch,
         )
 
     async def _async_ensure_client(self) -> bool:

@@ -614,6 +614,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: FluvalConfigEntry) -> bo
             # reconnect - in practice immediate, since a preferred_proxy
             # change reloads the entry and rebuilds this Device anyway.
             preferred_getter=lambda: entry.options.get(CONF_PREFERRED_PROXY) or None,
+            # Read live: the proxy that last held the link, for the silent-ghost release.
+            last_holder_getter=lambda: entry.options.get(CONF_LAST_HOLDING_PROXY) or None,
         )
         device.entry_id = entry.entry_id
         runtime.device = device
