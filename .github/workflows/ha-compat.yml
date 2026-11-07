@@ -29,4 +29,4 @@ jobs:
           uv pip install $prerelease "pytest-homeassistant[bluetooth]" -r manifest-requirements.txt
       # The real-Home-Assistant suite lives in tests_ha/. The stub suite in tests/
       # fakes Home Assistant and runs in ci.yml, so the two are never mixed.
-      - run: uv run --no-project pytest -c tests_ha/pytest.ini
+      - run: uv run --no-project pytest -c tests_ha/pytest.ini tests_ha

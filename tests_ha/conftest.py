@@ -2,7 +2,7 @@
 
 Unlike ``tests/`` (a stub suite that runs on plain Python with no Home Assistant
 installed), everything here runs against a real Home Assistant core. Run it from
-the repository root with ``pytest -c tests_ha/pytest.ini``.
+the repository root with ``pytest -c tests_ha/pytest.ini tests_ha``.
 """
 
 import pytest

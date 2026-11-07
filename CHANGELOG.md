@@ -17,7 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - On Home Assistant 2026.10 and earlier, a renamed guardian-backed entity (schedule status, corrections, schedule problem, return-to-schedule) stopped updating until the next reload: Home Assistant re-adds the same entity object after an id change, but its guardian subscription was made once in `__init__` and dropped on removal. The subscription is now remade when the entity is added.
 
 ### Added
-- `tests_ha/` (real Home Assistant, run with `pytest -c tests_ha/pytest.ini`) and the `HA compatibility` workflow (`.github/workflows/ha-compat.yml`, stable and beta Home Assistant, weekly): set-up through a real config entry with a fake Bluetooth link, device registry entry from `DeviceInfo`, entity-id change keeps the link and the repair issue, config and options flows return `step_id`, entity classes need no re-add on 2026.11.
+- `tests_ha/` (real Home Assistant, run with `pytest -c tests_ha/pytest.ini tests_ha`) and the `HA compatibility` workflow (`.github/workflows/ha-compat.yml`, stable and beta Home Assistant, weekly): set-up through a real config entry with a fake Bluetooth link, device registry entry from `DeviceInfo`, entity-id change keeps the link and the repair issue, config and options flows return `step_id`, entity classes need no re-add on 2026.11.
 - The stub-based suite in `tests/` is unchanged apart from replacing the four legacy-listener tests with one test that the options reload belongs to the options flow alone.
 
 ---
