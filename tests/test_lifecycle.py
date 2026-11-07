@@ -2,6 +2,7 @@
 
 import asyncio
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 import types
 from unittest.mock import AsyncMock, MagicMock
@@ -12,27 +13,23 @@ from custom_components.fluvalble import (
     DOMAIN,
     FluvalRuntimeData,
     _store_entry_runtime_data,
-    _async_update_listener,
-    _register_legacy_options_reload,
     _register_static_paths,
     async_unload_entry,
     entry_runtime_data,
 )
 from custom_components.fluvalble import binary_sensor, button, light, select, sensor, switch
+from custom_components.fluvalble.config_flow import OptionsFlowHandler
 
 
-def test_current_options_flow_does_not_register_second_reload_listener():
-    """Current HA owns the reload, so setup must not add another path."""
-    entry = SimpleNamespace(
-        add_update_listener=MagicMock(),
-        async_on_unload=MagicMock(),
-    )
+def test_options_reload_belongs_to_the_options_flow_alone():
+    """An update listener next to OptionsFlowWithReload is an error from Home Assistant 2026.12."""
+    package = Path(__file__).parents[1] / "custom_components" / "fluvalble"
+    offenders = [
+        path.name for path in package.rglob("*.py") if "add_update_listener" in path.read_text(encoding="utf-8")
+    ]
 
-    _register_legacy_options_reload(entry)
-
-    assert hasattr(config_entries, "OptionsFlowWithReload")
-    entry.add_update_listener.assert_not_called()
-    entry.async_on_unload.assert_not_called()
+    assert offenders == []
+    assert issubclass(OptionsFlowHandler, config_entries.OptionsFlowWithReload)
 
 
 def test_runtime_data_falls_back_to_hass_data_on_home_assistant_2024_1():
@@ -86,72 +83,6 @@ async def _async_test_all_entity_platforms_support_legacy_runtime_storage():
         await platform_module.async_setup_entry(hass, entry, add_entities)
         add_entities.assert_not_called()
         assert runtime.pending_add_entities[platform] is add_entities
-
-
-def test_legacy_options_flow_registers_one_reload_listener(monkeypatch):
-    """Supported older HA versions retain one listener-based reload path."""
-    remove_listener = MagicMock()
-    entry = SimpleNamespace(
-        add_update_listener=MagicMock(return_value=remove_listener),
-        async_on_unload=MagicMock(),
-    )
-    monkeypatch.delattr(config_entries, "OptionsFlowWithReload")
-
-    _register_legacy_options_reload(entry)
-
-    entry.add_update_listener.assert_called_once_with(_async_update_listener)
-    entry.async_on_unload.assert_called_once_with(remove_listener)
-
-
-def test_legacy_options_listener_reloads_once():
-    """The compatibility listener delegates one reload to Home Assistant."""
-    asyncio.run(_async_test_legacy_options_listener_reloads_once())
-
-
-async def _async_test_legacy_options_listener_reloads_once():
-    reload_entry = AsyncMock()
-    hass = SimpleNamespace(
-        data={DOMAIN: {}},
-        config_entries=SimpleNamespace(async_reload=reload_entry),
-    )
-    entry = SimpleNamespace(entry_id="entry_1", options={"expected_mode": "pro"})
-
-    await _async_update_listener(hass, entry)
-
-    reload_entry.assert_awaited_once_with("entry_1")
-
-
-def test_legacy_options_listener_ignores_recovery_option_writes():
-    """The link watcher's own bookkeeping must never reload the entry.
-
-    `last_holding_proxy` is rewritten whenever the link lands on a different
-    proxy, so reloading on it would mean a reload per reconnect - a reload
-    loop for exactly the flapping link the watcher exists to report.
-    """
-    asyncio.run(_async_test_legacy_options_listener_ignores_recovery_option_writes())
-
-
-async def _async_test_legacy_options_listener_ignores_recovery_option_writes():
-    reload_entry = AsyncMock()
-    runtime = FluvalRuntimeData(setup_options={"expected_mode": "pro"})
-    entry = SimpleNamespace(
-        entry_id="entry_1",
-        options={"expected_mode": "pro", "last_holding_proxy": "plant-room-bluetooth-proxy"},
-        runtime_data=runtime,
-    )
-    hass = SimpleNamespace(
-        data={DOMAIN: {entry.entry_id: runtime}},
-        config_entries=SimpleNamespace(async_reload=reload_entry),
-    )
-
-    await _async_update_listener(hass, entry)
-
-    reload_entry.assert_not_awaited()
-
-    entry.options = {"expected_mode": "auto", "last_holding_proxy": "plant-room-bluetooth-proxy"}
-    await _async_update_listener(hass, entry)
-
-    reload_entry.assert_awaited_once_with("entry_1")
 
 
 def test_unload_stops_software_preview_task():

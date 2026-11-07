@@ -16,10 +16,7 @@ try:
 except ImportError:  # Home Assistant before 2024.4
     from homeassistant.data_entry_flow import FlowResult as ConfigFlowResult
 
-try:
-    from homeassistant.config_entries import OptionsFlowWithReload as OptionsFlowBase
-except ImportError:  # Home Assistant before 2025.8
-    from homeassistant.config_entries import OptionsFlow as OptionsFlowBase  # type: ignore[no-redef]
+from homeassistant.config_entries import OptionsFlowWithReload
 from homeassistant.const import CONF_MAC
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
@@ -456,23 +453,16 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         config_entry: config_entries.ConfigEntry,
     ) -> config_entries.OptionsFlow:
         """Return the options flow handler."""
-        if hasattr(config_entries, "OptionsFlowWithReload"):
-            return OptionsFlowHandler()
-        return OptionsFlowHandler(config_entry)
+        return OptionsFlowHandler()
 
 
-class OptionsFlowHandler(OptionsFlowBase):
-    """Handle options and let Home Assistant reload the config entry once."""
+class OptionsFlowHandler(OptionsFlowWithReload):
+    """Handle options and let Home Assistant reload the config entry once.
 
-    def __init__(self, legacy_config_entry: config_entries.ConfigEntry | None = None) -> None:
-        super().__init__()
-        self._legacy_config_entry = legacy_config_entry
-
-    def _config_entry(self) -> config_entries.ConfigEntry:
-        """Return the entry on both legacy and current options-flow APIs."""
-        if self._legacy_config_entry is not None:
-            return self._legacy_config_entry
-        return self.config_entry
+    The reload belongs to `OptionsFlowWithReload`; the integration must never
+    also register a config entry update listener (an error from Home Assistant
+    2026.12), and none does.
+    """
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Show and handle the options form."""
@@ -494,10 +484,10 @@ class OptionsFlowHandler(OptionsFlowBase):
             # (last_holding_proxy, recovery_outlet) written by the link
             # watcher and the repairs fix flow. A plain `data=user_input`
             # would silently wipe all of them on every options save.
-            merged = {**self._config_entry().options, **user_input}
+            merged = {**self.config_entry.options, **user_input}
             return self.async_create_entry(title="", data=merged)
 
-        entry_options = self._config_entry().options
+        entry_options = self.config_entry.options
         return self.async_show_form(
             step_id="init",
             data_schema=self.add_suggested_values_to_schema(

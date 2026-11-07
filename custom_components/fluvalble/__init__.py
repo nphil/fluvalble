@@ -15,7 +15,6 @@ from typing import Any, TypeAlias
 
 import voluptuous as vol
 
-from homeassistant import config_entries
 from homeassistant.components import bluetooth
 from homeassistant.components import websocket_api
 from homeassistant.config_entries import ConfigEntry
@@ -35,7 +34,6 @@ from .core import (
     CONF_LAST_HOLDING_PROXY,
     CONF_PING_INTERVAL,
     CONF_PREFERRED_PROXY,
-    CONF_RECOVERY_OUTLET,
     DEFAULT_ACTIVE_TIME,
     DEFAULT_PING_INTERVAL,
     DOMAIN,
@@ -80,10 +78,6 @@ class FluvalRuntimeData:
     link_watcher: LinkWatcher | None = None
     pending_add_entities: dict[Platform, Any] = field(default_factory=dict)
     background_tasks: set[asyncio.Task] = field(default_factory=set, repr=False)
-    # Options this entry was set up with, minus the recovery bookkeeping the
-    # link watcher and the fix flow write themselves - see
-    # _async_update_listener for why the difference matters.
-    setup_options: dict[str, Any] = field(default_factory=dict, repr=False)
     # Set by the Stage-1 shutdown job before it touches the link. Never
     # cleared: a reload builds a new FluvalRuntimeData.
     closing: bool = False
@@ -158,6 +152,19 @@ def _async_lookup_registry_device(
     if lookup_by_identifier is not None and entry_id is not None:
         return lookup_by_identifier(identifier, config_entry_id=entry_id)
     return registry.async_get_device(identifiers={identifier})
+
+
+def _device_config_entry_ids(device_entry: Any) -> set[str]:
+    """Return the config entries a device registry row belongs to.
+
+    Home Assistant 2026.8 made a device belong to exactly one config entry
+    (`DeviceEntry.config_entry_id`) and deprecated the `config_entries` set,
+    which reports a usage warning. Older cores only have the set.
+    """
+    entry_id = getattr(device_entry, "config_entry_id", None)
+    if entry_id is not None:
+        return {entry_id}
+    return set(getattr(device_entry, "config_entries", set()) or set())
 
 
 @callback
@@ -563,7 +570,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: FluvalConfigEntry) -> bo
     _migrate_legacy_registry_entries(hass, entry, mac)
     _cleanup_duplicate_devices(hass, entry, mac)
 
-    runtime = FluvalRuntimeData(setup_options=_reload_relevant_options(entry))
+    runtime = FluvalRuntimeData()
     _store_entry_runtime_data(hass, entry, runtime)
     # Before any device can be created below: an unreachable fixture never
     # produces a Device at all, and that outage is the one most worth
@@ -738,8 +745,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: FluvalConfigEntry) -> bo
 
         entry.async_on_unload(_remove_pending_startup_listener)
 
-    _register_legacy_options_reload(entry)
-
     _LOGGER.debug("Setup complete for %s — waiting for BLE", mac)
     return True
 
@@ -802,7 +807,7 @@ def _cleanup_duplicate_devices(hass: HomeAssistant, entry: ConfigEntry, mac: str
         if duplicate.id == canonical.id:
             continue
 
-        foreign_config_entries = set(getattr(duplicate, "config_entries", set()) or set()) - {entry.entry_id}
+        foreign_config_entries = _device_config_entry_ids(duplicate) - {entry.entry_id}
         foreign_entities = [
             entity
             for entity in all_entities
@@ -821,36 +826,6 @@ def _cleanup_duplicate_devices(hass: HomeAssistant, entry: ConfigEntry, mac: str
                 entity_registry.async_update_entity(entity.entity_id, device_id=canonical.id)
         _LOGGER.info("Removing duplicate Fluval device registry entry %s", duplicate.id)
         device_registry.async_remove_device(duplicate.id)
-
-
-def _register_legacy_options_reload(entry: ConfigEntry) -> None:
-    """Retain options reloads on HA versions before OptionsFlowWithReload."""
-    if hasattr(config_entries, "OptionsFlowWithReload"):
-        return
-    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
-
-
-# Options this integration writes to itself rather than through the options
-# form. None of them change how the entry is set up, so none of them may
-# trigger a reload: `last_holding_proxy` is rewritten whenever the link
-# lands on a different proxy, and a reload-per-connect would be a reload
-# loop for exactly the flapping link this recovery machinery exists for.
-RECOVERY_OPTION_KEYS = frozenset({CONF_LAST_HOLDING_PROXY, CONF_RECOVERY_OUTLET})
-
-
-def _reload_relevant_options(entry: ConfigEntry) -> dict[str, Any]:
-    """Return the entry options whose change requires a reload to apply."""
-    return {key: value for key, value in entry.options.items() if key not in RECOVERY_OPTION_KEYS}
-
-
-async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload options on Home Assistant versions without the reload helper."""
-    runtime = entry_runtime_data(hass, entry)
-    current = _reload_relevant_options(entry)
-    if runtime is not None and runtime.setup_options == current:
-        _LOGGER.debug("Skipping Fluval reload for %s: only recovery options changed", entry.entry_id)
-        return
-    await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def _register_static_paths(hass: HomeAssistant) -> None:
@@ -905,7 +880,7 @@ def _register_services(hass: HomeAssistant) -> None:
         device_entry = dr.async_get(hass).async_get(device_id)
         if device_entry is None:
             raise HomeAssistantError("The selected Home Assistant device no longer exists")
-        entry_ids = set(getattr(device_entry, "config_entries", set()) or set())
+        entry_ids = _device_config_entry_ids(device_entry)
         if not entry_ids:
             raise HomeAssistantError("The selected device is not managed by Fluval BLE")
         return entry_ids

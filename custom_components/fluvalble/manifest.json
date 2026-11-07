@@ -77,6 +77,10 @@
       "service_uuid": "facebd00-0000-1000-8000-00805f9b34fb"
     }
   ],
+  "categories": [
+    "lighting",
+    "pets"
+  ],
   "codeowners": [
     "@nphil"
   ],
@@ -93,5 +97,5 @@
     "custom_components.fluvalble"
   ],
   "requirements": [],
-  "version": "1.5.5"
+  "version": "1.5.6"
 }

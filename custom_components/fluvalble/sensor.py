@@ -136,6 +136,11 @@ class FluvalConnectionSensor(FluvalEntity, SensorEntity):
         self.internal_update()
 
     @callback
+    def async_entity_id_changed(self, old_entity_id: str) -> None:
+        """Opt in to in-place entity_id changes (the allocation callback is not keyed on it)."""
+        super().async_entity_id_changed(old_entity_id)
+
+    @callback
     def _allocations_changed(self, *_args) -> None:
         """Re-derive the holding proxy after habluetooth reports a change."""
         self.internal_update()

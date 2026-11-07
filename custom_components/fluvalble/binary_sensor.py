@@ -4,7 +4,7 @@ from homeassistant.components.binary_sensor import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory, Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -78,6 +78,11 @@ class FluvalScheduleProblemBinarySensor(FluvalGuardianEntity, BinarySensorEntity
         """Reconcile the repair once this entity is live for the entry."""
         await super().async_added_to_hass()
         self._sync_repair_issue()
+
+    @callback
+    def async_entity_id_changed(self, old_entity_id: str) -> None:
+        """Opt in to in-place entity_id changes (the repair issue is keyed on the device, not the entity_id)."""
+        super().async_entity_id_changed(old_entity_id)
 
     def internal_update(self) -> None:
         """Update state from the guardian and keep the repair issue in sync."""

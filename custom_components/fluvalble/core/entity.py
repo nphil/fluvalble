@@ -1,7 +1,9 @@
 """Base entity of a Fluval BLE connected LED device for home assistant."""
 
+from collections.abc import Callable
 from typing import NoReturn
 
+from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH
 from homeassistant.helpers.entity import DeviceInfo, Entity
@@ -56,6 +58,21 @@ class FluvalEntity(Entity):
             )
         )
 
+    @callback
+    def async_entity_id_changed(self, old_entity_id: str) -> None:
+        """Stay added when the entity_id is changed in the entity registry.
+
+        Home Assistant 2026.11 changes an entity_id in place instead of removing
+        and re-adding the entity, but only for classes that define this hook
+        next to `async_added_to_hass` (every Fluval entity class that defines
+        `async_added_to_hass` or `async_will_remove_from_hass` repeats it, since
+        core checks each class that defines one). Nothing here is keyed on the
+        entity_id: updates are registered by attribute name and the BLE link
+        belongs to the Device, so there is nothing to move and the link must
+        never be touched by a rename.
+        """
+        super().async_entity_id_changed(old_entity_id)
+
     def _raise_command_error(self) -> NoReturn:
         """Raise a translated Home Assistant error for a failed device command."""
         raise HomeAssistantError(
@@ -90,8 +107,32 @@ class FluvalGuardianEntity(FluvalEntity):
         """
         self.guardian = guardian
         super().__init__(device, attr)
-        self.async_on_remove(self.guardian.add_listener(self._update_handler))
+        self._guardian_unsubscribe: Callable[[], None] | None = None
+        self._subscribe_guardian()
+
+    def _subscribe_guardian(self) -> None:
+        """Listen to the guardian; the removal callback also forgets the subscription."""
+        unsubscribe = self.guardian.add_listener(self._update_handler)
+
+        def _unsubscribe() -> None:
+            self._guardian_unsubscribe = None
+            unsubscribe()
+
+        self._guardian_unsubscribe = _unsubscribe
+        self.async_on_remove(_unsubscribe)
 
     async def async_added_to_hass(self) -> None:
-        """Run Entity's own setup without Device.register_update wiring."""
+        """Run Entity's own setup without Device.register_update wiring.
+
+        Home Assistant 2026.10 and earlier re-add the same entity object after
+        an entity_id change, having already run its removal callbacks, so the
+        guardian subscription made in __init__ must be made again.
+        """
         await Entity.async_added_to_hass(self)
+        if self._guardian_unsubscribe is None:
+            self._subscribe_guardian()
+
+    @callback
+    def async_entity_id_changed(self, old_entity_id: str) -> None:
+        """Opt in to in-place entity_id changes; see FluvalEntity."""
+        super().async_entity_id_changed(old_entity_id)

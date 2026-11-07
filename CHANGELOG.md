@@ -5,6 +5,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.5.6]
+
+### Changed
+- **Home Assistant 2026.11 compatibility (still works on 2026.10).** Renaming an entity's id in the entity registry no longer removes and re-adds the entity on 2026.11; every Fluval entity class that defines `async_added_to_hass` (`FluvalEntity`, `FluvalGuardianEntity`, `FluvalLight`, the Connection sensor, the schedule-problem binary sensor) now also defines `async_entity_id_changed`, so core updates it in place. Nothing in the integration is keyed on the entity_id and the Bluetooth link belongs to the `Device`, so a rename never touches the link.
+- Device-registry lookups use `DeviceEntry.config_entry_id` first and only fall back to the deprecated `config_entries` set (`_device_config_entry_ids` in `__init__.py`); `async_get_device(identifiers=...)` is no longer used when the entry id is known.
+- The options flow always uses `OptionsFlowWithReload` (reload after an options change is done by Home Assistant) and `OptionsFlowHandler()` no longer takes the config entry as an argument. The old `add_update_listener` fallback for Home Assistant versions without `OptionsFlowWithReload` was dead code (the HACS minimum, 2026.1.0, already has it) and would be an error from 2026.12; it is removed.
+- Manifest `categories`: `lighting`, `pets`.
+
+### Fixed
+- On Home Assistant 2026.10 and earlier, a renamed guardian-backed entity (schedule status, corrections, schedule problem, return-to-schedule) stopped updating until the next reload: Home Assistant re-adds the same entity object after an id change, but its guardian subscription was made once in `__init__` and dropped on removal. The subscription is now remade when the entity is added.
+
+### Added
+- `tests_ha/` (real Home Assistant, run with `pytest -c tests_ha/pytest.ini`) and the `HA compatibility` workflow (`.github/workflows/ha-compat.yml`, stable and beta Home Assistant, weekly): set-up through a real config entry with a fake Bluetooth link, device registry entry from `DeviceInfo`, entity-id change keeps the link and the repair issue, config and options flows return `step_id`, entity classes need no re-add on 2026.11.
+- The stub-based suite in `tests/` is unchanged apart from replacing the four legacy-listener tests with one test that the options reload belongs to the options flow alone.
+
+---
+
 ## [1.5.5]
 
 ### Added

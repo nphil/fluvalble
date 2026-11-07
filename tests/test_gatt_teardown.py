@@ -10,7 +10,7 @@ disconnecting (an entry-owned guardian check on reload or release_link).
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 from bleak import BleakError
 

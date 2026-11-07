@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from bleak import BleakError
 from custom_components.fluvalble.core import encryption, protocol
 from custom_components.fluvalble.core import client as client_module
 from custom_components.fluvalble.core.client import Client

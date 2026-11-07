@@ -90,6 +90,11 @@ class FluvalLight(FluvalEntity, LightEntity):
             async_track_time_interval(self.hass, _rerender_from_schedule, _SCHEDULE_RERENDER_INTERVAL)
         )
 
+    @callback
+    def async_entity_id_changed(self, old_entity_id: str) -> None:
+        """Opt in to in-place entity_id changes (the re-render tick is not keyed on it)."""
+        super().async_entity_id_changed(old_entity_id)
+
     def internal_update(self) -> None:
         """Refresh the entity from decoded fixture state."""
         self._attr_available = self.device.controls_available
